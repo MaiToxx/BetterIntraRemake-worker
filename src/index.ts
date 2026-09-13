@@ -1,3 +1,4 @@
+import { handleIntraAuth } from "./handlers/intra-auth";
 import { handleCallback, handleLogin } from "./handlers/auth";
 import {
   handlePrivateSettings,
@@ -77,6 +78,11 @@ export default {
     if (url.pathname === "/callback") {
       if (request.method !== "GET") return textRes("Method not allowed", 405);
       return handleCallback(request, env);
+    }
+
+    // Login with the Intra v3 session token (no 42 OAuth application needed)
+    if (url.pathname === "/auth/intra") {
+      return handleIntraAuth(request, env);
     }
 
     if (url.pathname.startsWith("/gh/")) {
