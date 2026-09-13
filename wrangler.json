@@ -5,21 +5,14 @@
   "kv_namespaces": [
     {
       "binding": "BETTER_INTRA_KV",
-      "id": "TO_FILL_AFTER_KV_CREATE"
-    }
-  ],
-  "r2_buckets": [
-    {
-      "bucket_name": "better-intra-images",
-      "binding": "better_intra_images",
-      "remote": true
+      "id": "225f0f647c59475798c118ed9b1dde59"
     }
   ],
   "d1_databases": [
     {
       "binding": "better_intra_d1",
       "database_name": "better-intra-d1",
-      "database_id": "TO_FILL_AFTER_D1_CREATE"
+      "database_id": "93d714a6-f83a-4aa3-be0e-3a09d6277035"
     }
   ],
   "vars": {
