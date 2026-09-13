@@ -1,11 +1,11 @@
 {
-  "name": "better-intra-worker",
+  "name": "betterintra-remake",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-01",
   "kv_namespaces": [
     {
       "binding": "BETTER_INTRA_KV",
-      "id": "76d494582f944fd6b0f7e02b51fed387"
+      "id": "TO_FILL_AFTER_KV_CREATE"
     }
   ],
   "r2_buckets": [
@@ -19,17 +19,19 @@
     {
       "binding": "better_intra_d1",
       "database_name": "better-intra-d1",
-      "database_id": "42210594-bca8-4d11-a89c-b5e63bdf218d"
+      "database_id": "TO_FILL_AFTER_D1_CREATE"
     }
   ],
   "vars": {
-    "CLIENT_ID": "u-s4t2ud-8a3189d9af041af2f8775dc0f3b6ea37d1ee7b3c1a9cb8581dac62b631144138",
-    "DISCORD_CLIENT_ID": "1515309907795251300",
-    "DISCORD_ENABLED": "true",
-    "DISCORD_GUILD_ID": "1464227219923533838"
+    "CLIENT_ID": "TO_FILL_42_APP_UID",
+    "DISCORD_ENABLED": "false"
   },
   "triggers": {
-    "crons": ["*/10 * * * *", "* * * * *", "0 22,4,10,16 * * *"]
+    "crons": [
+      "*/10 * * * *",
+      "* * * * *",
+      "0 22,4,10,16 * * *"
+    ]
   },
   "observability": {
     "enabled": false,

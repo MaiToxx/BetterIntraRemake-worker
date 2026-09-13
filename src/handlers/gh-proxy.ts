@@ -1,8 +1,8 @@
 import { corsHeaders, textRes } from "../utils";
 
 const SOURCES = [
-  "https://raw.githubusercontent.com/nicopasla/better-intra/main",
-  "https://cdn.jsdelivr.net/gh/nicopasla/better-intra@main",
+  "https://raw.githubusercontent.com/MaiToxx/BetterIntraRemake/main",
+  "https://cdn.jsdelivr.net/gh/MaiToxx/BetterIntraRemake@main",
 ];
 
 const CONTENT_TYPES: Record<string, string> = {
