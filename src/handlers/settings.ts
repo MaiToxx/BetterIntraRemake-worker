@@ -7,6 +7,49 @@ import {
   validateSession,
 } from "../utils";
 
+/**
+ * Customize settings a user may publish on their profile (opt-in through
+ * CUSTOM_SHARE_LOOK). Presentation only: fonts, size, scrollbar and the
+ * free-form CSS never leave their author. The extension validates every
+ * value again before using it.
+ */
+export const PUBLIC_LOOK_KEYS = [
+  "CUSTOM_ACCENT_ENABLED",
+  "CUSTOM_ACCENT_COLOR",
+  "CUSTOM_ACCENT_GRADIENT",
+  "CUSTOM_ACCENT_COLOR_2",
+  "CUSTOM_RADIUS",
+  "CUSTOM_THEME_ENABLED",
+  "CUSTOM_THEME_BG",
+  "CUSTOM_THEME_CARD",
+  "CUSTOM_THEME_TEXT",
+  "CUSTOM_PAGE_BG_URL",
+  "CUSTOM_PAGE_BG_DIM",
+  "CUSTOM_PAGE_BG_PRESET",
+  "CUSTOM_BG_ANIMATE",
+  "CUSTOM_CARD_OPACITY",
+  "CUSTOM_CARD_STYLE",
+  "CUSTOM_AVATAR_SHAPE",
+] as const;
+
+const MAX_LOOK_STRING = 2048;
+
+export function publicLook(
+  settings: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (settings.CUSTOM_SHARE_LOOK !== true) return null;
+  const out: Record<string, unknown> = {};
+  for (const key of PUBLIC_LOOK_KEYS) {
+    const v = settings[key];
+    if (typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) {
+      out[key] = v;
+    } else if (typeof v === "string" && v.length <= MAX_LOOK_STRING) {
+      out[key] = v;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
 export async function handlePublicVisuals(
   request: Request,
   existingData: UserData | null,
@@ -16,6 +59,9 @@ export async function handlePublicVisuals(
   const settings = existingData?.settings || {};
 
   return jsonRes({
+    // Look published by the user for visitors of their profile (or null)
+    look: publicLook(settings),
+
     // Existing visual settings
     avatar: settings.PROFILE_IMAGE_URL || "",
     banner: settings.PROFILE_BANNER_URL || "",
