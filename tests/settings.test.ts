@@ -21,11 +21,13 @@ describe("publicLook", () => {
       CUSTOM_FONT_SCALE: 120,
       CUSTOM_PAGE_BG_URL: "x".repeat(5000),
       CUSTOM_CARD_STYLE: { nested: true },
+      CUSTOM_CARDS: { agenda: { bg: "#112233" } },
     });
     expect(look).toEqual({
       CUSTOM_ACCENT_ENABLED: true,
       CUSTOM_ACCENT_COLOR: "#ff0000",
       CUSTOM_PAGE_BG_DIM: 40,
+      CUSTOM_CARDS: { agenda: { bg: "#112233" } },
     });
   });
 });

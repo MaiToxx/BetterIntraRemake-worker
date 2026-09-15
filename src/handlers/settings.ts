@@ -30,9 +30,18 @@ export const PUBLIC_LOOK_KEYS = [
   "CUSTOM_CARD_OPACITY",
   "CUSTOM_CARD_STYLE",
   "CUSTOM_AVATAR_SHAPE",
+  "CUSTOM_CARD_BORDER_MODE",
+  "CUSTOM_CARD_BORDER_COLOR",
+  "CUSTOM_CARD_BORDER_WIDTH",
+  "CUSTOM_CARD_GLOW",
+  "CUSTOM_CARD_TITLE_MODE",
+  "CUSTOM_CARD_TITLE_COLOR",
+  "CUSTOM_CARDS",
 ] as const;
 
 const MAX_LOOK_STRING = 2048;
+/** Only object-valued look key (per-card colours); bounded like the strings. */
+const OBJECT_KEYS = new Set<string>(["CUSTOM_CARDS"]);
 
 export function publicLook(
   settings: Record<string, unknown>,
@@ -44,6 +53,14 @@ export function publicLook(
     if (typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) {
       out[key] = v;
     } else if (typeof v === "string" && v.length <= MAX_LOOK_STRING) {
+      out[key] = v;
+    } else if (
+      OBJECT_KEYS.has(key) &&
+      v &&
+      typeof v === "object" &&
+      !Array.isArray(v) &&
+      JSON.stringify(v).length <= MAX_LOOK_STRING
+    ) {
       out[key] = v;
     }
   }
