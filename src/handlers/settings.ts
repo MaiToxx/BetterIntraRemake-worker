@@ -67,6 +67,78 @@ export function publicLook(
   return Object.keys(out).length > 0 ? out : null;
 }
 
+/**
+ * "Public profile" extras a user adds to their own profile page (bio, status,
+ * links, name style, avatar frame, particle effect...), seen by every visitor.
+ *
+ * This list is a copy of EXTRAS_KEYS in the extension
+ * (src/features/profile/extras/extras.ts): the worker cannot import from the
+ * extension, so both lists must be kept in sync by hand. Nothing outside this
+ * list is ever published through `extras`.
+ */
+export const PUBLIC_EXTRAS_KEYS = [
+  "PROFILE_PUB_ENABLED",
+  "PROFILE_PUB_BIO",
+  "PROFILE_PUB_STATUS_EMOJI",
+  "PROFILE_PUB_STATUS_TEXT",
+  "PROFILE_PUB_PRONOUNS",
+  "PROFILE_PUB_FLAIR",
+  "PROFILE_PUB_GREETING",
+  "PROFILE_PUB_LINK_GITHUB",
+  "PROFILE_PUB_LINK_GITLAB",
+  "PROFILE_PUB_LINK_LINKEDIN",
+  "PROFILE_PUB_LINK_WEBSITE",
+  "PROFILE_PUB_LINK_DISCORD",
+  "PROFILE_PUB_NAME_STYLE",
+  "PROFILE_PUB_NAME_COLOR",
+  "PROFILE_PUB_NAME_COLOR_2",
+  "PROFILE_PUB_NAME_FONT",
+  "PROFILE_PUB_FRAME",
+  "PROFILE_PUB_FRAME_COLOR",
+  "PROFILE_PUB_FRAME_COLOR_2",
+  "PROFILE_PUB_LEVEL_STYLE",
+  "PROFILE_PUB_LEVEL_COLOR",
+  "PROFILE_PUB_LEVEL_COLOR_2",
+  "PROFILE_PUB_BANNER_GRADIENT",
+  "PROFILE_PUB_BANNER_DIM",
+  "PROFILE_PUB_BANNER_BLUR",
+  "PROFILE_PUB_CARD_GLOW",
+  "PROFILE_PUB_EFFECT",
+  "PROFILE_PUB_EFFECT_INTENSITY",
+  "PROFILE_PUB_EFFECT_TINT",
+  "PROFILE_PUB_EFFECT_COLOR",
+] as const;
+
+/** Far above every limit of the extension's sanitizer (longest: a link URL). */
+const MAX_EXTRAS_STRING = 512;
+
+/**
+ * Extras published for the visitors of a profile, or null. Published unless
+ * the owner switched them off (PROFILE_PUB_ENABLED === false). The worker only
+ * bounds the payload (known keys, primitive values, short strings): the
+ * extension validates every value again before using it.
+ */
+export function publicExtras(
+  settings: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (settings.PROFILE_PUB_ENABLED === false) return null;
+  const out: Record<string, unknown> = {};
+  let published = 0;
+  for (const key of PUBLIC_EXTRAS_KEYS) {
+    const v = settings[key];
+    if (typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) {
+      out[key] = v;
+    } else if (typeof v === "string" && v.length > 0 && v.length <= MAX_EXTRAS_STRING) {
+      out[key] = v;
+    } else {
+      continue;
+    }
+    if (key !== "PROFILE_PUB_ENABLED") published++;
+  }
+  // The switch alone says nothing about the profile
+  return published > 0 ? out : null;
+}
+
 export async function handlePublicVisuals(
   request: Request,
   existingData: UserData | null,
@@ -78,6 +150,9 @@ export async function handlePublicVisuals(
   return jsonRes({
     // Look published by the user for visitors of their profile (or null)
     look: publicLook(settings),
+
+    // Public profile extras (bio, status, links, name style...) or null
+    extras: publicExtras(settings),
 
     // Existing visual settings
     avatar: settings.PROFILE_IMAGE_URL || "",
