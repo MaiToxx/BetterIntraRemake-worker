@@ -114,6 +114,42 @@ describe("publicExtras", () => {
   });
 
   it("publishes PROFILE_PUB_* keys only, without duplicates", () => {
+    // Pinned copy of EXTRAS_KEYS in the extension
+    // (src/features/profile/extras/extras.ts). The two lists are kept in
+    // sync by hand: a change here means the extension must be updated too,
+    // and this worker redeployed, before visitors see the new key.
+    expect([...PUBLIC_EXTRAS_KEYS]).toEqual([
+  "PROFILE_PUB_ENABLED",
+  "PROFILE_PUB_BIO",
+  "PROFILE_PUB_STATUS_EMOJI",
+  "PROFILE_PUB_STATUS_TEXT",
+  "PROFILE_PUB_PRONOUNS",
+  "PROFILE_PUB_FLAIR",
+  "PROFILE_PUB_GREETING",
+  "PROFILE_PUB_LINK_GITHUB",
+  "PROFILE_PUB_LINK_GITLAB",
+  "PROFILE_PUB_LINK_LINKEDIN",
+  "PROFILE_PUB_LINK_WEBSITE",
+  "PROFILE_PUB_LINK_DISCORD",
+  "PROFILE_PUB_NAME_STYLE",
+  "PROFILE_PUB_NAME_COLOR",
+  "PROFILE_PUB_NAME_COLOR_2",
+  "PROFILE_PUB_NAME_FONT",
+  "PROFILE_PUB_FRAME",
+  "PROFILE_PUB_FRAME_COLOR",
+  "PROFILE_PUB_FRAME_COLOR_2",
+  "PROFILE_PUB_LEVEL_STYLE",
+  "PROFILE_PUB_LEVEL_COLOR",
+  "PROFILE_PUB_LEVEL_COLOR_2",
+  "PROFILE_PUB_BANNER_GRADIENT",
+  "PROFILE_PUB_BANNER_DIM",
+  "PROFILE_PUB_BANNER_BLUR",
+  "PROFILE_PUB_CARD_GLOW",
+  "PROFILE_PUB_EFFECT",
+  "PROFILE_PUB_EFFECT_INTENSITY",
+  "PROFILE_PUB_EFFECT_TINT",
+  "PROFILE_PUB_EFFECT_COLOR",
+    ]);
     expect(PUBLIC_EXTRAS_KEYS[0]).toBe("PROFILE_PUB_ENABLED");
     expect(new Set(PUBLIC_EXTRAS_KEYS).size).toBe(PUBLIC_EXTRAS_KEYS.length);
     for (const key of PUBLIC_EXTRAS_KEYS) expect(key).toMatch(/^PROFILE_PUB_[A-Z0-9_]+$/);
