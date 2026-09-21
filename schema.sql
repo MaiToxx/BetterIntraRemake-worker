@@ -87,6 +87,18 @@ CREATE TABLE IF NOT EXISTS calendar_ics (
   PRIMARY KEY (login_hash)
 );
 
+-- One live calendar link per login (revoked_at IS NULL); revoked tokens stay
+-- as tombstones so they can never be registered again. Also created on first
+-- use by src/handlers/calendar.ts.
+CREATE TABLE IF NOT EXISTS calendar_tokens (
+  token TEXT PRIMARY KEY,
+  login_hash TEXT NOT NULL,
+  revoked_at INTEGER,
+  created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE INDEX IF NOT EXISTS calendar_tokens_login ON calendar_tokens (login_hash);
+
 CREATE TABLE IF NOT EXISTS logtime_history (
   login TEXT PRIMARY KEY,
   days_json TEXT NOT NULL,

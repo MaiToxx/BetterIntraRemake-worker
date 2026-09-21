@@ -1,4 +1,5 @@
 import { Env, UserData } from "../types";
+import { deleteCalendarData } from "./calendar";
 import {
   getBearerToken,
   getTokens,
@@ -229,6 +230,17 @@ export async function handlePrivateSettings(
       ...body.settings,
     };
 
+    // The namespace shares 1,000 KV writes a day, and past the limit every
+    // put throws until midnight UTC (sign-ins included). A push that changes
+    // nothing (hub reload with auto-push, Push with no edit, a control set to
+    // its current value) must not spend one.
+    if (
+      JSON.stringify(settingsToSave) ===
+      JSON.stringify(existingData.settings || {})
+    ) {
+      return textRes("Saved");
+    }
+
     await env.BETTER_INTRA_KV.put(
       loginParam,
       JSON.stringify({
@@ -249,6 +261,9 @@ export async function handlePrivateSettings(
   if (request.method === "DELETE") {
     const url = new URL(request.url);
     if (url.searchParams.get("all") === "true") {
+      // Calendar first: if it fails the user record, and so the session
+      // needed to retry, is still there.
+      await deleteCalendarData(env, loginParam, existingData.settings);
       await env.BETTER_INTRA_KV.delete(loginParam);
       return textRes("All cloud data deleted");
     }

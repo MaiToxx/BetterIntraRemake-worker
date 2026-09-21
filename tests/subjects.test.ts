@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   handleSubjectsReport,
   handleSubjectsState,
+  normalizeSubjectUrl,
 } from "../src/handlers/subjects";
 import { Env, UserData } from "../src/types";
 
@@ -106,8 +107,9 @@ function get(url: string): Request {
   return new Request(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
 }
 
-const URL_A = "https://cdn.example.com/pdf/pdf/900001/en.subject.example.pdf";
-const URL_B = "https://cdn.example.com/pdf/pdf/900002/en.subject.example.pdf";
+// The host tracker.ts reports: the first PDF attachment of a project page.
+const URL_A = "https://cdn.intra.42.fr/pdf/pdf/900001/en.subject.pdf";
+const URL_B = "https://cdn.intra.42.fr/pdf/pdf/900002/en.subject.pdf";
 
 function pdfResponse(modDate: string): Response {
   const text = `<< /CreationDate (${modDate}) /ModDate (${modDate}) /Producer (pdfTeX-1.40.28) >>`;
@@ -268,6 +270,129 @@ describe("handleSubjectsReport", () => {
     });
   });
 
+  it("never fetches or records a URL off the Intra subject hosts", async () => {
+    const calls = mockPdfFetch(["D:20990101000000Z"]);
+    const res = await handleSubjectsReport(
+      post("https://x/report", {
+        items: [
+          { slug: "minishell", url: "https://evil.example/pdf/pdf/900001/en.subject.pdf" },
+          { slug: "minishell", url: "http://cdn.intra.42.fr/pdf/pdf/900001/en.subject.pdf" },
+          { slug: "minishell", url: "https://cdn.intra.42.fr.evil.example/pdf/pdf/1/en.subject.pdf" },
+          { slug: "minishell", url: "https://cdn.intra.42.fr@evil.example/pdf/pdf/1/en.subject.pdf" },
+          { slug: "minishell", url: "not a url" },
+        ],
+      }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const body = (await res.json()) as { subjects: any[] };
+    expect(body.subjects).toHaveLength(5);
+    for (const entry of body.subjects) {
+      expect(entry).toEqual({ slug: "minishell", status: "unknown", reason: "invalid_url" });
+    }
+    expect(calls).toEqual([]);
+    expect(d1.subjects.size).toBe(0);
+  });
+
+  it("rejects malformed slugs before any work", async () => {
+    const calls = mockPdfFetch(["D:20260811161924+02'00'"]);
+    const res = await handleSubjectsReport(
+      post("https://x/report", {
+        items: [
+          { slug: "x".repeat(101), url: URL_A },
+          { slug: "../libft", url: URL_A },
+          { slug: "libft minishell", url: URL_A },
+          { slug: "-libft", url: URL_A },
+        ],
+      }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const body = (await res.json()) as { subjects: any[] };
+    expect(body.subjects.map((e) => e.reason)).toEqual([
+      "invalid_slug",
+      "invalid_slug",
+      "invalid_slug",
+      "invalid_slug",
+    ]);
+    expect(body.subjects[0].slug).toHaveLength(100);
+    expect(calls).toEqual([]);
+    expect(d1.subjects.size).toBe(0);
+  });
+
+  it("accepts real project slugs", async () => {
+    mockPdfFetch(["D:20260811161924+02'00'"]);
+    const slugs = ["42cursus-libft", "ft_printf", "c-piscine-c-00", "python-module-10"];
+    const res = await handleSubjectsReport(
+      post("https://x/report", { items: slugs.map((slug) => ({ slug, url: URL_A })) }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const body = (await res.json()) as { subjects: any[] };
+    expect(body.subjects.map((e) => e.status)).toEqual(["first", "first", "first", "first"]);
+  });
+
+  it("stores the link without query or fragment, like the extension sends it", async () => {
+    const calls = mockPdfFetch(["D:20260811161924+02'00'"]);
+    await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: `${URL_A}?x=1#page=2` }] }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    expect(calls).toEqual([URL_A]);
+    expect(d1.subjects.get("libft")?.url).toBe(URL_A);
+  });
+
+  it("handles at most 5 items per request", async () => {
+    const calls = mockPdfFetch(["D:20260811161924+02'00'"]);
+    const items = Array.from({ length: 12 }, (_, i) => ({ slug: `project-${i}`, url: URL_A }));
+    const res = await handleSubjectsReport(
+      post("https://x/report", { items }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const body = (await res.json()) as { subjects: any[] };
+    expect(body.subjects).toHaveLength(5);
+    expect(calls).toHaveLength(5);
+  });
+
+  it("does not follow a redirect off the subject hosts", async () => {
+    const calls: string[] = [];
+    (globalThis as any).fetch = vi.fn(async (url: string) => {
+      calls.push(url);
+      return new Response(null, { status: 302, headers: { Location: "https://evil.example/x.pdf" } });
+    });
+    const res = await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: URL_A }] }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const body = (await res.json()) as { subjects: any[] };
+    expect(body.subjects[0]).toMatchObject({ status: "first", createdAt: null, modifiedAt: null });
+    expect(calls).toEqual([URL_A]);
+  });
+
+  it("does not buffer an oversized PDF", async () => {
+    (globalThis as any).fetch = vi.fn(
+      async () =>
+        new Response("x", { status: 200, headers: { "Content-Length": String(64 * 1024 * 1024) } }),
+    );
+    const res = await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: URL_A }] }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const body = (await res.json()) as { subjects: any[] };
+    expect(body.subjects[0]).toMatchObject({ status: "first", modifiedAt: null });
+  });
+
   it("rejects entries missing a slug or url", async () => {
     const res = await handleSubjectsReport(
       post("https://x/report", { items: [{ slug: "" }, { url: URL_A }] }),
@@ -280,6 +405,32 @@ describe("handleSubjectsReport", () => {
       { slug: "", status: "unknown", reason: "missing_slug_or_url" },
       { slug: "", status: "unknown", reason: "missing_slug_or_url" },
     ]);
+  });
+});
+
+describe("normalizeSubjectUrl", () => {
+  it("keeps https PDFs on the Intra subject hosts, without query or fragment", () => {
+    expect(normalizeSubjectUrl(URL_A)).toBe(URL_A);
+    expect(normalizeSubjectUrl(`${URL_A}?a=1#b`)).toBe(URL_A);
+    expect(normalizeSubjectUrl("https://CDN.INTRA.42.FR/pdf/pdf/1/en.subject.PDF")).toBe(
+      "https://cdn.intra.42.fr/pdf/pdf/1/en.subject.PDF",
+    );
+    expect(normalizeSubjectUrl("https://projects.intra.42.fr/uploads/document/1/en.subject.pdf")).toBe(
+      "https://projects.intra.42.fr/uploads/document/1/en.subject.pdf",
+    );
+  });
+
+  it("refuses everything else", () => {
+    for (const bad of [
+      "https://cdn.intra.42.fr/users/someone.jpg",
+      "https://meta.intra.42.fr/x.pdf",
+      "https://cdn.intra.42.fr:444/pdf/pdf/1/en.subject.pdf",
+      "https://u:p@cdn.intra.42.fr/pdf/pdf/1/en.subject.pdf",
+      "ftp://cdn.intra.42.fr/pdf/pdf/1/en.subject.pdf",
+      "",
+    ]) {
+      expect(normalizeSubjectUrl(bad)).toBeNull();
+    }
   });
 });
 
@@ -300,6 +451,19 @@ describe("handleSubjectsState", () => {
       sessionData(),
     );
     expect(res.status).toBe(401);
+  });
+
+  it("skips malformed slugs and caps the list", async () => {
+    const many = Array.from({ length: 30 }, (_, i) => `p-${i}`);
+    const res = await handleSubjectsState(
+      get(`https://x/state?slugs=${encodeURIComponent(["../x", ...many].join(","))}`),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const body = (await res.json()) as { subjects: any[] };
+    expect(body.subjects).toHaveLength(20);
+    expect(body.subjects[0].slug).toBe("p-0");
   });
 
   it("returns tracked:false for unknown slugs", async () => {

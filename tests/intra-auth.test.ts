@@ -10,7 +10,7 @@ import {
 import type { Env } from "../src/types";
 
 // Node 20+ exposes WebCrypto globally, like the Workers runtime does.
-const subtle = globalThis.crypto.subtle;
+const subtle = crypto.subtle;
 
 function b64url(bytes: Uint8Array | string): string {
   const b = typeof bytes === "string" ? Buffer.from(bytes) : Buffer.from(bytes);
@@ -22,11 +22,11 @@ let jwks: Jwk[];
 let otherJwks: Jwk[];
 
 async function makeKey(kid: string) {
-  const pair = await subtle.generateKey(
+  const pair = (await subtle.generateKey(
     { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
     true,
     ["sign", "verify"],
-  );
+  )) as CryptoKeyPair;
   const pub = (await subtle.exportKey("jwk", pair.publicKey)) as JsonWebKey;
   return { priv: pair.privateKey, jwk: { kid, kty: "RSA", alg: "RS256", use: "sig", n: pub.n!, e: pub.e! } as Jwk };
 }
@@ -112,6 +112,10 @@ function makeEnv(kvSeed: Record<string, unknown> = {}) {
         puts.push(key);
         kv.set(key, value);
       },
+      delete: async (key: string) => {
+        puts.push(key);
+        kv.delete(key);
+      },
     },
     better_intra_d1: {
       prepare: () => ({ bind: () => ({ run: async () => ({}) }) }),
@@ -147,7 +151,7 @@ describe("handleIntraAuth JWKS handling", () => {
     const { env, puts } = makeEnv({ INTRA_JWKS_CACHE: jwks });
     const res = await handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env);
     expect(res.status).toBe(200);
-    expect((await res.json()).login).toBe("alepayen");
+    expect(((await res.json()) as { login: string }).login).toBe("alepayen");
     expect(fetchMock).not.toHaveBeenCalled();
     expect(puts).not.toContain("INTRA_JWKS_CACHE");
   });
@@ -194,6 +198,72 @@ describe("handleIntraAuth JWKS handling", () => {
     const later = await sign({ ...validPayload(), exp: Math.floor(now / 1000) + 3600 }, privateKey, "k-rotated");
     expect((await handleIntraAuth(authRequest(later), env)).status).toBe(401);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("never writes KV for forged tokens, even across fresh isolates", async () => {
+    // Valid-looking claims and a random kid, signed by a key Keycloak does not
+    // have: the old code refetched and rewrote the JWKS once per isolate every
+    // 5 minutes, which a few PoPs could turn into the whole daily write budget.
+    const { priv: attackerKey } = await makeKey("x");
+    const forged = await sign(validPayload(), attackerKey, "attacker-kid");
+
+    for (const seed of [{}, { INTRA_JWKS_CACHE: jwks }]) {
+      const { env, puts } = makeEnv(seed);
+      for (let isolate = 0; isolate < 5; isolate++) {
+        resetJwksRefreshThrottle(); // a new isolate: no in-memory state
+        vi.setSystemTime(now + isolate * (JWKS_REFRESH_MIN_INTERVAL_MS + 1000));
+        const fresh = await sign(
+          { ...validPayload(), exp: Math.floor(now / 1000) + 24 * 3600 },
+          attackerKey,
+          "attacker-kid",
+        );
+        expect((await handleIntraAuth(authRequest(isolate ? fresh : forged), env)).status).toBe(401);
+      }
+      expect(puts).toEqual([]);
+    }
+  });
+
+  it("does not refetch within an isolate once it holds keys, stored or not", async () => {
+    const { env, puts } = makeEnv();
+    const { priv: attackerKey } = await makeKey("x");
+    // a forged token with the real kid fetches the keys once, stores nothing
+    const forged = await sign(validPayload(), attackerKey, "k1");
+    expect((await handleIntraAuth(authRequest(forged), env)).status).toBe(401);
+    expect((await handleIntraAuth(authRequest(forged), env)).status).toBe(401);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(puts).toEqual([]);
+
+    // the next genuine sign-in uses the fetched keys and stores them
+    expect((await handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env)).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(puts).toContain("INTRA_JWKS_CACHE");
+  });
+
+  it("answers 503 when the key server is down and no key set is known", async () => {
+    fetchMock.mockImplementation(async () => new Response("down", { status: 502 }));
+    const { env, puts } = makeEnv();
+    const res = await handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env);
+    expect(res.status).toBe(503);
+    expect(await res.text()).toMatch(/key server/i);
+    // a retry inside the throttle window is told the same, without a new fetch
+    const retry = await handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env);
+    expect(retry.status).toBe(503);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(puts).toEqual([]);
+  });
+
+  it("still signs in when caching the key set fails", async () => {
+    const { env } = makeEnv();
+    let calls = 0;
+    const put = env.BETTER_INTRA_KV.put.bind(env.BETTER_INTRA_KV);
+    (env.BETTER_INTRA_KV as any).put = async (key: string, value: string) => {
+      calls++;
+      if (key === "INTRA_JWKS_CACHE") throw new Error("KV put() limit exceeded for the day.");
+      return put(key, value);
+    };
+    const res = await handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env);
+    expect(res.status).toBe(200);
+    expect(calls).toBe(2);
   });
 
   it("fetches the JWKS when the cache is empty and stores it", async () => {

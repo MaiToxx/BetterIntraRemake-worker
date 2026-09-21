@@ -23,7 +23,8 @@ const JWKS_TTL_S = 6 * 60 * 60;
  * A token whose `kid` is missing from the cached key set triggers a refetch of
  * the JWKS (Keycloak rotates keys), but this endpoint is unauthenticated: an
  * attacker must not be able to make the worker hammer auth.42.fr and rewrite
- * KV on every request. Refetches are throttled per isolate.
+ * KV on every request. Refetches are throttled per isolate, and a fetched key
+ * set only reaches KV once a token verified with it (see handleIntraAuth).
  */
 export const JWKS_REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -172,37 +173,70 @@ async function fetchJwks(): Promise<Jwk[]> {
 /** Wall-clock time of the last JWKS fetch made by this isolate (0 = never). */
 let lastJwksFetchAt = 0;
 
-/** Test hook: forget the last fetch time so a refresh is allowed again. */
+/**
+ * Key set this isolate last fetched from Keycloak. A forged token can make the
+ * worker fetch the JWKS but never store it (KV writes are capped at 1,000 a
+ * day for the whole namespace), so the fetched set is kept here, where the
+ * next token, forged or not, finds it without another request.
+ */
+let fetchedJwks: { keys: Jwk[]; at: number } | null = null;
+
+/** Test hook: forget the last fetch so a refresh is allowed again. */
 export function resetJwksRefreshThrottle(): void {
   lastJwksFetchAt = 0;
+  fetchedJwks = null;
 }
 
-async function getJwks(env: Env, forceRefresh = false, now = Date.now()): Promise<Jwk[]> {
-  if (!forceRefresh) {
-    const cached = await env.BETTER_INTRA_KV.get(JWKS_CACHE_KEY, { type: "json" });
-    if (Array.isArray(cached) && cached.length > 0) return cached as Jwk[];
-  }
-  lastJwksFetchAt = now;
-  const keys = await fetchJwks();
-  await env.BETTER_INTRA_KV.put(JWKS_CACHE_KEY, JSON.stringify(keys), {
-    expirationTtl: JWKS_TTL_S,
-  });
-  return keys;
+interface KeySets {
+  /** Keys to verify the token with. */
+  keys: Jwk[];
+  /** What KV holds, to tell whether `keys` is worth storing. */
+  stored: Jwk[] | null;
 }
 
 /**
- * Key set to verify a token with. The cached set is used unless the token
- * names a `kid` that is not in it (a rotated key), in which case the JWKS is
- * refetched, at most once per JWKS_REFRESH_MIN_INTERVAL_MS. A token with an
- * unknown kid arriving inside that window is simply verified against the
- * cached keys (and fails).
+ * Key set to verify a token with: the KV copy, else this isolate's last fetch,
+ * whichever knows the token's `kid`. When neither does (a rotated key, an empty
+ * cache) the JWKS is refetched, at most once per JWKS_REFRESH_MIN_INTERVAL_MS
+ * per isolate; inside that window the token is verified against what is known
+ * (and fails). Throws when a needed fetch fails, or failed and nothing is known.
  */
-async function getJwksForToken(env: Env, kid: string | undefined, now: number): Promise<Jwk[]> {
-  const cached = await getJwks(env, false, now);
-  if (kid === undefined) return cached;
-  if (cached.some((k) => k.kid === kid)) return cached;
-  if (now - lastJwksFetchAt < JWKS_REFRESH_MIN_INTERVAL_MS) return cached;
-  return getJwks(env, true, now);
+async function getJwksForToken(env: Env, kid: string | undefined, now: number): Promise<KeySets> {
+  const raw = await env.BETTER_INTRA_KV.get(JWKS_CACHE_KEY, { type: "json" });
+  const stored = Array.isArray(raw) && raw.length > 0 ? (raw as Jwk[]) : null;
+  if (fetchedJwks && now - fetchedJwks.at > JWKS_TTL_S * 1000) fetchedJwks = null;
+  const memory = fetchedJwks?.keys ?? null;
+
+  const knows = (set: Jwk[] | null): set is Jwk[] =>
+    !!set && (kid === undefined ? set.length > 0 : set.some((k) => k.kid === kid));
+  if (knows(stored)) return { keys: stored, stored };
+  if (knows(memory)) return { keys: memory, stored };
+  if (now - lastJwksFetchAt < JWKS_REFRESH_MIN_INTERVAL_MS) {
+    const known = stored ?? memory;
+    // No key at all means the last fetch failed: say so rather than "invalid"
+    if (!known) throw new Error("JWKS unavailable, last fetch failed");
+    return { keys: known, stored };
+  }
+
+  lastJwksFetchAt = now;
+  const keys = await fetchJwks();
+  fetchedJwks = { keys, at: now };
+  return { keys, stored };
+}
+
+/**
+ * Store the key set a token was just verified with, when KV does not already
+ * hold it. Best effort: a failed cache write must not fail the sign-in.
+ */
+async function storeJwks(env: Env, sets: KeySets): Promise<void> {
+  if (sets.stored && JSON.stringify(sets.stored) === JSON.stringify(sets.keys)) return;
+  try {
+    await env.BETTER_INTRA_KV.put(JWKS_CACHE_KEY, JSON.stringify(sets.keys), {
+      expirationTtl: JWKS_TTL_S,
+    });
+  } catch (e) {
+    console.warn(`[intra-auth] JWKS cache write failed: ${e}`);
+  }
 }
 
 export async function handleIntraAuth(
@@ -229,9 +263,18 @@ export async function handleIntraAuth(
     return textRes("Invalid or expired Intra token", 401);
   }
 
-  const jwks = await getJwksForToken(env, decoded.header.kid, now);
-  const verified = await verifyIntraJwt(body.token, jwks, now);
+  let sets: KeySets;
+  try {
+    sets = await getJwksForToken(env, decoded.header.kid, now);
+  } catch (e) {
+    console.warn(`[intra-auth] JWKS fetch failed: ${e}`);
+    return textRes("Intra key server unreachable, retry in a minute", 503);
+  }
+  const verified = await verifyIntraJwt(body.token, sets.keys, now);
+  // Nothing is written before this point: a forged or invalid token never
+  // costs a KV write.
   if (!verified) return textRes("Invalid or expired Intra token", 401);
+  await storeJwks(env, sets);
 
   const rawLogin = verified.login;
   const hashedLogin = await hashLogin(rawLogin);

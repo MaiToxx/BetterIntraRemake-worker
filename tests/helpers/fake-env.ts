@@ -1,0 +1,151 @@
+/**
+ * In-memory stand-ins for the worker's bindings.
+ *
+ * FakeD1 runs the SQL on a real SQLite (node:sqlite), with schema.sql applied,
+ * so constraints, JOINs and batches behave like D1 instead of like a mock that
+ * pattern-matches the queries. FakeKV counts writes and deletes, the budget
+ * the free plan caps at 1,000 a day.
+ */
+import type { Env } from "../../src/types";
+
+interface SqliteStatement {
+  get(...params: unknown[]): Record<string, unknown> | undefined;
+  all(...params: unknown[]): Record<string, unknown>[];
+  run(...params: unknown[]): { changes: number | bigint };
+}
+interface SqliteDatabase {
+  exec(sql: string): void;
+  prepare(sql: string): SqliteStatement;
+}
+
+// Loaded without an import so the worker's tsconfig (no Node types) is happy.
+const nodeProcess = (globalThis as any).process;
+const { DatabaseSync } = nodeProcess.getBuiltinModule("node:sqlite") as {
+  DatabaseSync: new (path: string) => SqliteDatabase;
+};
+const { readFileSync } = nodeProcess.getBuiltinModule("node:fs") as {
+  readFileSync(path: URL, encoding: "utf8"): string;
+};
+
+const SCHEMA = readFileSync(
+  new URL("../../schema.sql", (import.meta as { url?: string }).url),
+  "utf8",
+);
+
+class FakeStatement {
+  constructor(
+    private readonly db: SqliteDatabase,
+    readonly sql: string,
+    readonly params: unknown[] = [],
+  ) {}
+
+  bind(...params: unknown[]): FakeStatement {
+    return new FakeStatement(this.db, this.sql, params);
+  }
+
+  async first<T>(column?: string): Promise<T | null> {
+    const row = this.db.prepare(this.sql).get(...this.params);
+    if (!row) return null;
+    return (column ? row[column] : { ...row }) as T;
+  }
+
+  async all<T>(): Promise<{ results: T[]; success: true }> {
+    const rows = this.db.prepare(this.sql).all(...this.params);
+    return { results: rows.map((r) => ({ ...r }) as T), success: true };
+  }
+
+  async run(): Promise<{ success: true; meta: { changes: number } }> {
+    const r = this.db.prepare(this.sql).run(...this.params);
+    return { success: true, meta: { changes: Number(r.changes) } };
+  }
+}
+
+export class FakeD1 {
+  readonly raw: SqliteDatabase;
+  /** Every SQL text prepared, in order. */
+  readonly prepared: string[] = [];
+
+  constructor(opts: { schema?: boolean } = {}) {
+    this.raw = new DatabaseSync(":memory:");
+    if (opts.schema !== false) this.raw.exec(SCHEMA);
+  }
+
+  prepare(sql: string): FakeStatement {
+    this.prepared.push(sql);
+    return new FakeStatement(this.raw, sql);
+  }
+
+  /** Like D1: all statements in one transaction, rolled back on error. */
+  async batch(stmts: FakeStatement[]) {
+    this.raw.exec("BEGIN");
+    try {
+      const out = [];
+      for (const s of stmts) out.push(await s.run());
+      this.raw.exec("COMMIT");
+      return out;
+    } catch (e) {
+      this.raw.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
+  /** Test helper: rows of a query, run directly. */
+  rows(sql: string, ...params: unknown[]): Record<string, unknown>[] {
+    return this.raw
+      .prepare(sql)
+      .all(...params)
+      .map((r) => ({ ...r }));
+  }
+}
+
+export class FakeKV {
+  readonly data = new Map<string, string>();
+  readonly puts: string[] = [];
+  readonly deletes: string[] = [];
+  /** When set, put() throws this (the daily limit, an outage). */
+  putError: Error | null = null;
+
+  constructor(seed: Record<string, unknown> = {}) {
+    for (const [k, v] of Object.entries(seed)) {
+      this.data.set(k, typeof v === "string" ? v : JSON.stringify(v));
+    }
+  }
+
+  async get(key: string, opts?: { type?: string } | string): Promise<unknown> {
+    const raw = this.data.get(key);
+    if (raw === undefined) return null;
+    const type = typeof opts === "string" ? opts : opts?.type;
+    return type === "json" ? JSON.parse(raw) : raw;
+  }
+
+  async put(key: string, value: string): Promise<void> {
+    if (this.putError) throw this.putError;
+    this.puts.push(key);
+    this.data.set(key, value);
+  }
+
+  async delete(key: string): Promise<void> {
+    this.deletes.push(key);
+    this.data.delete(key);
+  }
+
+  json(key: string): any {
+    const raw = this.data.get(key);
+    return raw === undefined ? undefined : JSON.parse(raw);
+  }
+}
+
+export function makeEnv(
+  opts: { kv?: FakeKV; d1?: FakeD1; vars?: Partial<Env> } = {},
+): { env: Env; kv: FakeKV; d1: FakeD1 } {
+  const kv = opts.kv ?? new FakeKV();
+  const d1 = opts.d1 ?? new FakeD1();
+  const env = {
+    BETTER_INTRA_KV: kv,
+    better_intra_d1: d1,
+    CLIENT_ID: "TO_FILL_42_APP_UID",
+    CLIENT_SECRET: "",
+    ...opts.vars,
+  } as unknown as Env;
+  return { env, kv, d1 };
+}

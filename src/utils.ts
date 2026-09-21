@@ -46,6 +46,114 @@ export const textRes = (
     headers: { ...corsHeaders, "Content-Type": contentType },
   });
 
+/** Env keys whose values must never appear in a response body. */
+const SECRET_ENV_KEYS = [
+  "CLIENT_SECRET",
+  "TOKEN_ENCRYPTION_KEY",
+  "DISCORD_BOT_TOKEN",
+  "DISCORD_CLIENT_SECRET",
+  "PROJECT_REFRESH_SECRET",
+  "PROXY_SECRET",
+  "ANNOUNCEMENT_SECRET",
+] as const;
+
+/**
+ * Answer for an exception nothing else caught. Without it the runtime serves
+ * its own HTML error page with no CORS header, which the extension can only
+ * read as "could not reach the server". The body carries the message alone
+ * (never the stack), cut short, with every configured secret blanked out in
+ * case an upstream error echoed one back.
+ */
+export function serverErrorRes(e: unknown, env: Partial<Env>): Response {
+  console.error("[worker] unhandled error:", e);
+  let message = e instanceof Error ? e.message : String(e);
+  for (const key of SECRET_ENV_KEYS) {
+    const secret = env[key];
+    if (typeof secret === "string" && secret.length >= 6) {
+      message = message.split(secret).join("[redacted]");
+    }
+  }
+  return jsonRes(
+    { error: "server_error", message: message.slice(0, 200) },
+    500,
+  );
+}
+
+/**
+ * The `login` query parameter is always hashLogin() output. Checking the
+ * shape before the KV read keeps the user routes away from the internal keys
+ * that share the namespace (APP_TOKEN_CACHE, INTRA_JWKS_CACHE, discord_oauth_*,
+ * CALENDAR_TOKEN_*...).
+ */
+export function isLoginHash(value: string): boolean {
+  return /^[a-f0-9]{64}$/.test(value);
+}
+
+/**
+ * fetch() that only ever reaches hosts `isAllowed` accepts. Redirects are
+ * followed by hand (at most `maxRedirects`) and every Location is checked like
+ * the first URL, so an allowed host that redirects elsewhere cannot turn the
+ * worker into a proxy for any site. Returns null when a hop is refused or the
+ * chain is too long.
+ */
+export async function fetchAllowed(
+  url: URL,
+  isAllowed: (u: URL) => boolean,
+  init: RequestInit = {},
+  maxRedirects = 3,
+): Promise<Response | null> {
+  let current = url;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    if (!isAllowed(current)) return null;
+    const res = await fetch(current.href, { ...init, redirect: "manual" });
+    const location = res.headers.get("Location");
+    if (res.status < 300 || res.status >= 400 || !location) return res;
+    try {
+      current = new URL(location, current);
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Whole body of `res`, or null as soon as it is larger than `maxBytes`
+ * (announced by Content-Length or counted while streaming), so that a huge
+ * upstream file is never buffered in full.
+ */
+export async function readBodyCapped(
+  res: Response,
+  maxBytes: number,
+): Promise<Uint8Array | null> {
+  const declared = Number(res.headers.get("Content-Length") ?? "");
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    return null;
+  }
+  if (!res.body) return new Uint8Array(0);
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 export function getBearerToken(request: Request): string | null {
   return (
     request.headers.get("Authorization")?.match(/^Bearer\s+(.+)$/i)?.[1] ?? null
@@ -75,9 +183,30 @@ export async function hashLogin(login: string): Promise<string> {
     .join("");
 }
 
+/**
+ * True when this deployment has a real 42 OAuth application. The committed
+ * wrangler.json carries a placeholder CLIENT_ID ("TO_FILL_..."): with it every
+ * client_credentials or refresh_token call to api.intra.42.fr fails, so the
+ * work that needs a 42 app token is skipped instead of failing on every run.
+ */
+export function has42App(
+  env: Pick<Env, "CLIENT_ID" | "CLIENT_SECRET">,
+): boolean {
+  return (
+    typeof env.CLIENT_ID === "string" &&
+    env.CLIENT_ID !== "" &&
+    !env.CLIENT_ID.startsWith("TO_FILL") &&
+    !!env.CLIENT_SECRET
+  );
+}
+
 const pendingTokens = new WeakMap<Env, Promise<string>>();
 
 export async function getAppToken(env: Env): Promise<string> {
+  // Same outcome as the failed POST below, minus a KV read and a request
+  // that cannot succeed.
+  if (!has42App(env)) throw new Error("No 42 application configured");
+
   const cached = await env.BETTER_INTRA_KV.get<{
     token: string;
     expires: number;

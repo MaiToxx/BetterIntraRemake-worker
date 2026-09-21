@@ -1,5 +1,60 @@
 import { Env, UserData } from "../types";
-import { getBearerToken, jsonRes, textRes, validateSession } from "../utils";
+import {
+  fetchAllowed,
+  getBearerToken,
+  jsonRes,
+  readBodyCapped,
+  textRes,
+  validateSession,
+} from "../utils";
+
+/**
+ * Hosts a subject link can be on. tracker.ts reports the `href` of the first
+ * PDF attachment of a projects.intra.42.fr page (normalised to origin +
+ * pathname by fingerprint.ts): an absolute link to the Intra CDN, or a relative
+ * one, which resolves on projects.intra.42.fr. The worker fetches the URL, so
+ * any other host would let a signed-in user make it download anything.
+ */
+const SUBJECT_HOSTS = new Set(["cdn.intra.42.fr", "projects.intra.42.fr"]);
+
+/** Project slugs are short lowercase words joined by - or _. */
+const SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/i;
+
+/** The extension reports one subject per request: room to spare, no chains. */
+const MAX_REPORT_ITEMS = 5;
+const MAX_STATE_SLUGS = 20;
+
+/**
+ * Subject PDFs weigh a few MB. The dates sit in the Info dictionary, usually
+ * near the end of the file, so the body is read whole or not at all.
+ */
+const PDF_MAX_BYTES = 16 * 1024 * 1024;
+
+export function isValidSlug(slug: string): boolean {
+  return SLUG_RE.test(slug);
+}
+
+function isAllowedSubjectUrl(u: URL): boolean {
+  if (u.protocol !== "https:") return false;
+  if (u.username || u.password || u.port) return false;
+  return SUBJECT_HOSTS.has(u.hostname);
+}
+
+/**
+ * The URL as it is stored and fetched (origin + pathname, like the extension
+ * reports it), or null when it is not a PDF on a subject host.
+ */
+export function normalizeSubjectUrl(raw: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (!isAllowedSubjectUrl(u)) return null;
+  if (!/\.pdf$/i.test(u.pathname)) return null;
+  return `${u.origin}${u.pathname}`;
+}
 
 function parseSubjectIdFromUrl(url: string): string | null {
   return url.match(/\/pdf\/pdf\/(\d+)\//)?.[1] ?? null;
@@ -30,11 +85,12 @@ async function fetchPdfMetadata(
   url: string,
 ): Promise<{ createdAt: number | null; modifiedAt: number | null } | null> {
   try {
-    const res = await fetch(url, {
+    const res = await fetchAllowed(new URL(url), isAllowedSubjectUrl, {
       headers: { "User-Agent": "better-intra-subject-tracker" },
     });
-    if (!res.ok) return null;
-    const buf = await res.arrayBuffer();
+    if (!res || !res.ok) return null;
+    const buf = await readBodyCapped(res, PDF_MAX_BYTES);
+    if (!buf) return null;
     const text = new TextDecoder("iso-8859-1").decode(buf);
     const creationMatch = text.match(/\/CreationDate\s*\(([^)]*)\)/);
     const modifiedMatch = text.match(/\/ModDate\s*\(([^)]*)\)/);
@@ -128,7 +184,9 @@ export async function handleSubjectsReport(
   } catch {
     return textRes("Invalid JSON", 400);
   }
-  const items = Array.isArray(body?.items) ? body.items : [];
+  const items = Array.isArray(body?.items)
+    ? body.items.slice(0, MAX_REPORT_ITEMS)
+    : [];
 
   const now = Date.now();
   const results: any[] = [];
@@ -140,7 +198,22 @@ export async function handleSubjectsReport(
       continue;
     }
 
-    const url = item.url.trim();
+    // Checked before any D1 or network work: the registry is shared by every
+    // user, and the URL is fetched by the worker.
+    if (!isValidSlug(slug)) {
+      results.push({
+        slug: slug.slice(0, 100),
+        status: "unknown",
+        reason: "invalid_slug",
+      });
+      continue;
+    }
+    const url = normalizeSubjectUrl(item.url.trim());
+    if (!url) {
+      results.push({ slug, status: "unknown", reason: "invalid_url" });
+      continue;
+    }
+
     const subjectId = parseSubjectIdFromUrl(url);
     const name = await loadProjectName(env, slug);
 
@@ -230,7 +303,8 @@ export async function handleSubjectsState(
   const slugs = raw
     .split(",")
     .map((s) => s.trim())
-    .filter(Boolean);
+    .filter(isValidSlug)
+    .slice(0, MAX_STATE_SLUGS);
 
   const results: any[] = [];
   for (const slug of slugs) {

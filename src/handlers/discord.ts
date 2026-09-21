@@ -328,8 +328,10 @@ export async function handleDiscordCallback(
   if (!code || !nonce) return textRes("Missing code or state", 400);
 
   const stored = await env.BETTER_INTRA_KV.get(`discord_oauth_${nonce}`);
-  await env.BETTER_INTRA_KV.delete(`discord_oauth_${nonce}`);
+  // Unauthenticated route: a made-up state must not spend a KV delete (the
+  // daily write/delete budget is shared by the whole namespace).
   if (!stored) return textRes("Session expired", 400);
+  await env.BETTER_INTRA_KV.delete(`discord_oauth_${nonce}`);
 
   const { hashedLogin, redirectUri } = JSON.parse(stored) as {
     hashedLogin: string;
