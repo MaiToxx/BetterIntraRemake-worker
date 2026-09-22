@@ -157,6 +157,35 @@ describe("handleSubjectsReport", () => {
     expect(res.status).toBe(401);
   });
 
+  it("answers the same 401 for an unknown login as for a wrong token", async () => {
+    const snapshot = async (res: Response) => ({
+      status: res.status,
+      body: await res.text(),
+      headers: [...res.headers.entries()].sort(),
+    });
+    const wrong = await snapshot(
+      await handleSubjectsReport(
+        new Request("https://x/report", {
+          method: "POST",
+          headers: { Authorization: "Bearer forged" },
+          body: "{}",
+        }),
+        env,
+        "hash-a",
+        sessionData(),
+      ),
+    );
+    expect(wrong.status).toBe(401);
+    const unknown = await snapshot(
+      await handleSubjectsReport(post("https://x/report", {}), env, "hash-b", null),
+    );
+    expect(unknown).toEqual(wrong);
+    const unknownState = await snapshot(
+      await handleSubjectsState(get("https://x/state?slugs=libft"), env, "hash-b", null),
+    );
+    expect(unknownState).toEqual(wrong);
+  });
+
   it("seeds a new slug by reading the pdf metadata", async () => {
     const calls = mockPdfFetch(["D:20260811161924+02'00'"]);
     const res = await handleSubjectsReport(

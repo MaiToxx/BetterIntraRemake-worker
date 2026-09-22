@@ -1,11 +1,14 @@
 import { Env, UserData } from "../types";
 import { deleteCalendarData } from "./calendar";
+import { rateLimited, tooManyRes } from "../rate-limit";
 import {
   getBearerToken,
   getTokens,
+  isLoginHash,
   jsonRes,
+  readJsonBody,
+  requireSession,
   textRes,
-  validateSession,
 } from "../utils";
 
 /**
@@ -43,6 +46,31 @@ export const PUBLIC_LOOK_KEYS = [
 const MAX_LOOK_STRING = 2048;
 /** Only object-valued look key (per-card colours); bounded like the strings. */
 const OBJECT_KEYS = new Set<string>(["CUSTOM_CARDS"]);
+
+/**
+ * Bounds of a settings push. The whole record is read on every request that
+ * names the user, /api/v1/public/visuals included, so a bloated record slows
+ * every visitor of the profile and every friend row. A real record is a few
+ * KB; custom CSS and the URL history arrays stay far below 64 KB. No single
+ * value needs more than 8 KB: the longest legitimate ones are signed CDN URLs
+ * (1-2 KB) and a custom stylesheet.
+ */
+export const MAX_SETTINGS_BYTES = 64 * 1024;
+export const MAX_SETTING_STRING = 8 * 1024;
+
+/** Keep in sync with the extension's public-visuals sanitizer bounds. */
+const MAX_VISUAL_URL = 2048;
+const MAX_VISUAL_WORD = 64;
+
+/** Bulk get of the visuals route: one KV read per key still, one invocation. */
+export const MAX_VISUALS_LOGINS = 50;
+
+/**
+ * Visuals hardly change and the extension caches them for minutes anyway:
+ * letting the browser reuse a response across the friend rows and profile
+ * views of the same few minutes costs nothing.
+ */
+const VISUALS_CACHE = { "Cache-Control": "public, max-age=300" };
 
 export function publicLook(
   settings: Record<string, unknown>,
@@ -140,51 +168,139 @@ export function publicExtras(
   return published > 0 ? out : null;
 }
 
-export async function handlePublicVisuals(
-  request: Request,
-  existingData: UserData | null,
-): Promise<Response> {
-  if (request.method !== "GET") return textRes("Method not allowed", 405);
+/** `v` when it is a string no longer than `max`, else `fallback`. */
+function str(v: unknown, max: number, fallback = ""): string {
+  return typeof v === "string" && v.length <= max && v.length > 0 ? v : fallback;
+}
 
+/** `v` as a finite number, else `fallback`. */
+function num(v: unknown, fallback: number): number {
+  const n = typeof v === "number" ? v : Number(v ?? NaN);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function optStr(v: unknown, max: number): string | undefined {
+  return typeof v === "string" && v.length <= max ? v : undefined;
+}
+
+function optNum(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/**
+ * What every visitor of a profile receives. Every field is bounded here, not
+ * only at push time: a record stored by an older worker, or by a client that
+ * bypassed the push limits, must not be re-served to everyone as is.
+ */
+export function publicVisuals(existingData: UserData | null) {
   const settings = existingData?.settings || {};
-
-  return jsonRes({
+  return {
     // Look published by the user for visitors of their profile (or null)
     look: publicLook(settings),
 
     // Public profile extras (bio, status, links, name style...) or null
     extras: publicExtras(settings),
 
-    // Existing visual settings
-    avatar: settings.PROFILE_IMAGE_URL || "",
-    banner: settings.PROFILE_BANNER_URL || "",
-    bannerMode: settings.PROFILE_BANNER_MODE || "fill",
-    bannerColor: settings.PROFILE_BANNER_COLOR || "",
-    background: settings.PROFILE_BACKGROUND_URL || "",
-    backgroundMode: settings.PROFILE_BACKGROUND_MODE || "fill",
-    backgroundColor: settings.PROFILE_BACKGROUND_COLOR || "",
-    avatarBg: settings.PROFILE_AVATAR_BG || "transparent",
-    decoration: settings.PROFILE_DECORATION || "none",
-    avatarPosX: Number(settings.PROFILE_AVATAR_POSITION_X ?? 50),
-    avatarPosY: Number(settings.PROFILE_AVATAR_POSITION_Y ?? 50),
-    avatarScale: Number(settings.PROFILE_AVATAR_SCALE ?? 100),
-    badgeBg: settings.PROFILE_BADGE_BG || "",
+    avatar: str(settings.PROFILE_IMAGE_URL, MAX_VISUAL_URL),
+    banner: str(settings.PROFILE_BANNER_URL, MAX_VISUAL_URL),
+    bannerMode: str(settings.PROFILE_BANNER_MODE, MAX_VISUAL_WORD, "fill"),
+    bannerColor: str(settings.PROFILE_BANNER_COLOR, MAX_VISUAL_WORD),
+    background: str(settings.PROFILE_BACKGROUND_URL, MAX_VISUAL_URL),
+    backgroundMode: str(settings.PROFILE_BACKGROUND_MODE, MAX_VISUAL_WORD, "fill"),
+    backgroundColor: str(settings.PROFILE_BACKGROUND_COLOR, MAX_VISUAL_WORD),
+    avatarBg: str(settings.PROFILE_AVATAR_BG, MAX_VISUAL_WORD, "transparent"),
+    decoration: str(settings.PROFILE_DECORATION, MAX_VISUAL_WORD, "none"),
+    avatarPosX: num(settings.PROFILE_AVATAR_POSITION_X, 50),
+    avatarPosY: num(settings.PROFILE_AVATAR_POSITION_Y, 50),
+    avatarScale: num(settings.PROFILE_AVATAR_SCALE, 100),
+    badgeBg: str(settings.PROFILE_BADGE_BG, MAX_VISUAL_WORD),
 
     // Theme settings (for profile card)
     theme: {
-      profileColor: settings.LOGTIME_CALENDAR_COLOR,
+      profileColor: optStr(settings.LOGTIME_CALENDAR_COLOR, MAX_VISUAL_WORD),
     },
 
     // Public Logtime settings
     logtime: {
-      calendarColor: settings.LOGTIME_CALENDAR_COLOR,
-      labelsColor: settings.LOGTIME_LABELS_COLOR,
-      emoji: settings.LOGTIME_EMOJI,
-      emojiDivisor: settings.LOGTIME_EMOJI_DIVISOR,
-      emojiRate: settings.LOGTIME_EMOJI_RATE,
-      rainbowPalette: settings.LOGTIME_RAINBOW_PALETTE,
+      calendarColor: optStr(settings.LOGTIME_CALENDAR_COLOR, MAX_VISUAL_WORD),
+      labelsColor: optStr(settings.LOGTIME_LABELS_COLOR, MAX_VISUAL_WORD),
+      emoji: optStr(settings.LOGTIME_EMOJI, MAX_VISUAL_WORD),
+      emojiDivisor: optNum(settings.LOGTIME_EMOJI_DIVISOR),
+      emojiRate: optNum(settings.LOGTIME_EMOJI_RATE),
+      rainbowPalette: optStr(settings.LOGTIME_RAINBOW_PALETTE, MAX_VISUAL_URL),
     },
+  };
+}
+
+export async function handlePublicVisuals(
+  request: Request,
+  existingData: UserData | null,
+): Promise<Response> {
+  if (request.method !== "GET") return textRes("Method not allowed", 405);
+  return jsonRes(publicVisuals(existingData), 200, VISUALS_CACHE);
+}
+
+/**
+ * `logins` query parameter of the batch visuals route as KV keys: trimmed,
+ * deduplicated, every one a login hash. Null when one is not, or when there
+ * are more than MAX_VISUALS_LOGINS (the friends list is capped well below).
+ */
+export function parseVisualsLogins(raw: string): string[] | null {
+  const hashes = [...new Set(raw.split(",").map((s) => s.trim()).filter(Boolean))];
+  if (hashes.length === 0 || hashes.length > MAX_VISUALS_LOGINS) return null;
+  if (!hashes.every(isLoginHash)) return null;
+  return hashes;
+}
+
+/**
+ * GET /api/v1/public/visuals?logins=h1,h2,... -> { visuals: { h1: {...} } }
+ *
+ * One invocation for the whole friends list instead of one per friend. KV
+ * bills one read per key either way: the saving is Worker invocations and
+ * browser connections. An unknown hash gets the same defaults as the single
+ * form, so the batch says nothing about who has an account.
+ */
+export async function handlePublicVisualsBatch(
+  request: Request,
+  env: Env,
+  raw: string,
+): Promise<Response> {
+  if (request.method !== "GET") return textRes("Method not allowed", 405);
+  const hashes = parseVisualsLogins(raw);
+  if (!hashes) {
+    return textRes(
+      `logins must be 1 to ${MAX_VISUALS_LOGINS} login hashes`,
+      400,
+    );
+  }
+  const records = await env.BETTER_INTRA_KV.get<UserData>(hashes, {
+    type: "json",
   });
+  const visuals: Record<string, ReturnType<typeof publicVisuals>> = {};
+  for (const hash of hashes) {
+    visuals[hash] = publicVisuals(records.get(hash) ?? null);
+  }
+  return jsonRes({ visuals }, 200, VISUALS_CACHE);
+}
+
+/** Response to a push, or null when every value fits. */
+function checkSettingValues(settings: Record<string, unknown>): Response | null {
+  for (const [key, value] of Object.entries(settings)) {
+    if (typeof value === "string" && value.length > MAX_SETTING_STRING) {
+      return textRes(
+        `Setting ${key.slice(0, 64)} too long (max ${MAX_SETTING_STRING / 1024} KB)`,
+        413,
+      );
+    }
+  }
+  return null;
+}
+
+function tooLargeRes(): Response {
+  return textRes(
+    `Settings too large (max ${MAX_SETTINGS_BYTES / 1024} KB)`,
+    413,
+  );
 }
 
 export async function handlePrivateSettings(
@@ -193,77 +309,82 @@ export async function handlePrivateSettings(
   loginParam: string,
   existingData: UserData | null,
 ): Promise<Response> {
-  const authHeader = getBearerToken(request);
-  if (!authHeader) return textRes("Missing Authorization Token", 401);
+  const denied = requireSession(request, existingData);
+  if (denied) return denied;
+  // requireSession guarantees both
+  const record = existingData as UserData;
+  const authHeader = getBearerToken(request) as string;
 
-  if (!existingData) return textRes("User not found", 404);
-
-  if (!validateSession(existingData, authHeader)) {
-    return textRes("Unauthorized: Invalid Session Token", 401);
-  }
-
-  const tokensList = getTokens(existingData);
+  const tokensList = getTokens(record);
 
   if (request.method === "GET") {
+    const url = new URL(request.url);
+    // The hub's account card only needs the session count: the settings blob
+    // is what makes the record large.
+    if (url.searchParams.get("fields") === "meta") {
+      return jsonRes({ activeSessions: tokensList.length, discordId: null });
+    }
     return jsonRes({
-      settings: existingData.settings || {},
+      settings: record.settings || {},
       activeSessions: tokensList.length,
-      discordId: existingData.discordId,
-      discordUsername: existingData.discordUsername,
+      discordId: null,
     });
   }
 
   if (request.method === "POST") {
-    let body: any;
-    try {
-      body = await request.json();
-    } catch {
-      return textRes("Invalid JSON body", 400);
-    }
+    const body = await readJsonBody<{ settings?: unknown }>(
+      request,
+      MAX_SETTINGS_BYTES,
+      `Settings too large (max ${MAX_SETTINGS_BYTES / 1024} KB)`,
+    );
+    if (!body.ok) return body.response;
 
-    if (typeof body?.settings !== "object" || body.settings === null) {
+    const incoming = body.value?.settings;
+    if (typeof incoming !== "object" || incoming === null || Array.isArray(incoming)) {
       return textRes("Invalid settings payload", 400);
     }
+    const tooLong = checkSettingValues(incoming as Record<string, unknown>);
+    if (tooLong) return tooLong;
 
     const settingsToSave = {
-      ...(existingData.settings || {}),
-      ...body.settings,
+      ...(record.settings || {}),
+      ...(incoming as Record<string, unknown>),
     };
+    const serialized = JSON.stringify(settingsToSave);
 
     // The namespace shares 1,000 KV writes a day, and past the limit every
     // put throws until midnight UTC (sign-ins included). A push that changes
     // nothing (hub reload with auto-push, Push with no edit, a control set to
-    // its current value) must not spend one.
-    if (
-      JSON.stringify(settingsToSave) ===
-      JSON.stringify(existingData.settings || {})
-    ) {
+    // its current value) must not spend one, nor count against the limiter.
+    if (serialized === JSON.stringify(record.settings || {})) {
       return textRes("Saved");
     }
+    // The merged record is what gets stored: an existing large record must
+    // not be topped up past the cap one small push at a time.
+    if (serialized.length > MAX_SETTINGS_BYTES) return tooLargeRes();
+
+    if (await rateLimited(env, "write", loginParam)) return tooManyRes();
 
     await env.BETTER_INTRA_KV.put(
       loginParam,
-      JSON.stringify({
-        sessionTokens: tokensList,
-        settings: settingsToSave,
-        discordId: existingData.discordId,
-        discordUsername: existingData.discordUsername,
-        discordQuietEnabled: existingData.discordQuietEnabled,
-        discordQuietStart: existingData.discordQuietStart,
-        discordQuietEnd: existingData.discordQuietEnd,
-        discordQuietTimezone: existingData.discordQuietTimezone,
-        tokenBroken: existingData.tokenBroken,
-      }),
+      JSON.stringify({ sessionTokens: tokensList, settings: settingsToSave }),
     );
     return textRes("Saved");
   }
 
   if (request.method === "DELETE") {
+    if (await rateLimited(env, "write", loginParam)) return tooManyRes();
     const url = new URL(request.url);
     if (url.searchParams.get("all") === "true") {
-      // Calendar first: if it fails the user record, and so the session
-      // needed to retry, is still there.
-      await deleteCalendarData(env, loginParam, existingData.settings);
+      // Calendar first, then the D1 rows, then the record: if a step fails
+      // the user record, and so the session needed to retry, is still there.
+      await deleteCalendarData(env, loginParam, record.settings);
+      // The users row (login hash, country, sign-in date) feeds the public
+      // stats; "Wipe all data" must take the student out of them too.
+      await env.better_intra_d1
+        .prepare("DELETE FROM users WHERE hash = ?")
+        .bind(loginParam)
+        .run();
       await env.BETTER_INTRA_KV.delete(loginParam);
       return textRes("All cloud data deleted");
     }
@@ -271,14 +392,7 @@ export async function handlePrivateSettings(
       loginParam,
       JSON.stringify({
         sessionTokens: tokensList.filter((t) => t !== authHeader),
-        settings: existingData.settings || {},
-        discordId: existingData.discordId,
-        discordUsername: existingData.discordUsername,
-        discordQuietEnabled: existingData.discordQuietEnabled,
-        discordQuietStart: existingData.discordQuietStart,
-        discordQuietEnd: existingData.discordQuietEnd,
-        discordQuietTimezone: existingData.discordQuietTimezone,
-        tokenBroken: existingData.tokenBroken,
+        settings: record.settings || {},
       }),
     );
     return textRes("Session removed");

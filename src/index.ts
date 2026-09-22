@@ -1,92 +1,55 @@
 import { handleIntraAuth } from "./handlers/intra-auth";
-import { handleCallback, handleLogin } from "./handlers/auth";
 import {
   handlePrivateSettings,
   handlePublicVisuals,
+  handlePublicVisualsBatch,
 } from "./handlers/settings";
-import { handleFriendsData } from "./handlers/friends";
-import { handleProxy } from "./handlers/proxy";
 import { handleGhProxy } from "./handlers/gh-proxy";
-import { handleEvaluations } from "./handlers/evaluations";
 import { handleSubjectsReport, handleSubjectsState } from "./handlers/subjects";
-import { handleOutstanding } from "./handlers/outstanding";
-import { handleProfileStats } from "./handlers/profile-stats";
 import {
   handleCalendarToken,
   handleCalendarUpdate,
   handleCalendarIcs,
 } from "./handlers/calendar";
 import { handleClusterSvg, handleClusterSvgs } from "./handlers/clusters";
-import {
-  handleStudentsList,
-  handlePiscinersList,
-  handlePiscinesList,
-  handleStudentsRefresh,
-  handlePiscinersRefresh,
-  handleFutureStudentsList,
-  handleFutureStudentsRefresh,
-  refreshFutureStudents,
-} from "./handlers/students";
-import {
-  handleDiscordLink,
-  handleDiscordUnlink,
-  handleDiscordQuiet,
-  handleDiscordTest,
-  handleDiscordAuth,
-  handleDiscordCallback,
-} from "./handlers/discord";
-import { handleMainCron, handleRevealCatchup } from "./handlers/cron";
-import { handleLogtimeHistory } from "./handlers/logtime";
 import { handleAnnouncement } from "./handlers/announcement";
 import { handleStats } from "./handlers/stats";
-import { handleImageUpload } from "./handlers/image-upload";
-import { handleImageServe } from "./handlers/image-serve";
 import { Env, UserData } from "./types";
 import {
-  isOriginAllowed,
-  textRes,
-  getAppToken,
-  updateProjectMap,
-  jsonRes,
-  has42App,
+  getBearerToken,
   isLoginHash,
+  isOriginAllowed,
   serverErrorRes,
+  textRes,
 } from "./utils";
 
-let loggedNo42App = false;
-
+/**
+ * This worker serves the Intra-login build of the extension: no 42 OAuth
+ * application, no Discord, no R2. Every route that needed one of those (42
+ * OAuth login, evaluation reminders and their crons, Discord, image hosting,
+ * the students directory, logtime history, the 42 API proxy...) is gone
+ * rather than answering errors: the routes below are exactly the ones the
+ * extension calls (grep WORKER_URL in its src/).
+ */
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       return await route(request, env);
     } catch (e) {
-      return serverErrorRes(e, env);
-    }
-  },
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    // Every cron here needs a 42 application: the evaluation ones refresh the
-    // users' 42 tokens with CLIENT_ID/CLIENT_SECRET (tokens only an OAuth
-    // sign-in gives), the future-students one uses the app token. Without an
-    // app they can only fail, so they stop here, and stay declared in
-    // wrangler.json for deployments that have one.
-    if (!has42App(env)) {
-      if (!loggedNo42App) {
-        loggedNo42App = true;
-        console.log("[cron] skipped: no 42 application configured (CLIENT_ID)");
-      }
-      return;
-    }
-    if (event.cron === "*/10 * * * *") {
-      await handleMainCron(env, ctx);
-    }
-    if (event.cron === "* * * * *") {
-      await handleRevealCatchup(env, ctx);
-    }
-    if (event.cron === "0 22,4,10,16 * * *") {
-      await refreshFutureStudents(env);
+      return serverErrorRes(e, env, request);
     }
   },
 };
+
+/** Routes that name a user through `login=<hash>` and read their KV record. */
+const USER_ROUTES = new Set([
+  "/api/v1/public/visuals",
+  "/api/v1/private/settings",
+  "/api/v1/private/subjects/report",
+  "/api/v1/private/subjects/state",
+  "/api/v1/private/calendar/token",
+  "/api/v1/private/calendar/update",
+]);
 
 async function route(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -103,18 +66,14 @@ async function route(request: Request, env: Env): Promise<Response> {
         "Access-Control-Allow-Origin": acao,
         "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
         "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        // Every authenticated call is preflighted (Authorization header) and
+        // the browser default keeps the answer 5 s: without this, each worker
+        // call is two invocations. Chrome caps the cache at 7,200 s, Firefox
+        // honours a day.
+        "Access-Control-Max-Age": "86400",
+        Vary: "Origin",
       },
     });
-  }
-
-  if (url.pathname === "/login") {
-    if (request.method !== "GET") return textRes("Method not allowed", 405);
-    return handleLogin(request, env);
-  }
-
-  if (url.pathname === "/callback") {
-    if (request.method !== "GET") return textRes("Method not allowed", 405);
-    return handleCallback(request, env);
   }
 
   // Login with the Intra v3 session token (no 42 OAuth application needed)
@@ -126,29 +85,6 @@ async function route(request: Request, env: Env): Promise<Response> {
     return handleGhProxy(request);
   }
 
-  if (url.pathname === "/api/v1/private/discord/test") {
-    return handleDiscordTest(request, env);
-  }
-
-  if (url.pathname === "/api/v1/private/projects/refresh") {
-    if (request.method !== "POST") return textRes("Method not allowed", 405);
-    let body: any;
-    try {
-      body = await request.json();
-    } catch {
-      return textRes("Invalid JSON", 400);
-    }
-    if (!body?.secret || body.secret !== env.PROJECT_REFRESH_SECRET)
-      return textRes("Forbidden", 403);
-    try {
-      const appToken = await getAppToken(env);
-      await updateProjectMap(env, appToken);
-      return jsonRes({ refreshed: true });
-    } catch (e) {
-      return textRes(`Refresh failed: ${e}`, 500);
-    }
-  }
-
   if (url.pathname === "/api/v1/cluster/svg") {
     return handleClusterSvg(request, env, origin);
   }
@@ -157,36 +93,9 @@ async function route(request: Request, env: Env): Promise<Response> {
     return handleClusterSvgs(env, origin);
   }
 
-  if (url.pathname === "/api/v1/students/refresh") {
-    return handleStudentsRefresh(request, env);
-  }
-
-  if (url.pathname === "/api/v1/pisciners/refresh") {
-    return handlePiscinersRefresh(request, env);
-  }
-
-  if (url.pathname === "/api/v1/future-students/refresh") {
-    return handleFutureStudentsRefresh(request, env);
-  }
-
-  if (url.pathname === "/discord/auth") {
-    return handleDiscordAuth(request, env);
-  }
-
-  if (url.pathname === "/discord/callback") {
-    return handleDiscordCallback(request, env);
-  }
-
   const calMatch = url.pathname.match(/^\/calendar\/([^\/]+)\.ics$/);
   if (calMatch) {
     return handleCalendarIcs(calMatch[1], env);
-  }
-
-  const imgMatch = url.pathname.match(
-    /^\/api\/v1\/public\/images\/([a-f0-9-]+)$/,
-  );
-  if (imgMatch) {
-    return handleImageServe(request, env, imgMatch[1]);
   }
 
   if (url.pathname === "/api/v1/public/announcement") {
@@ -197,12 +106,28 @@ async function route(request: Request, env: Env): Promise<Response> {
     return handleStats(request, env);
   }
 
+  const loginsParam = url.searchParams.get("logins");
+  if (url.pathname === "/api/v1/public/visuals" && loginsParam !== null) {
+    return handlePublicVisualsBatch(request, env, loginsParam);
+  }
+
+  // Unknown paths are 404 whatever the query: the login checks below are for
+  // the user routes only.
+  if (!USER_ROUTES.has(url.pathname)) return textRes("Not found", 404);
+
   const loginParam = url.searchParams.get("login");
   if (!loginParam) {
     return textRes("Username hash required", 400);
   }
   if (!isLoginHash(loginParam)) {
     return textRes("Invalid username hash", 400);
+  }
+
+  // Every private route needs a Bearer token: refusing here, before the KV
+  // read, means an anonymous scanner spends no read out of the daily budget.
+  // Same 401 as a wrong token or an unknown login (see requireSession).
+  if (url.pathname.startsWith("/api/v1/private/") && !getBearerToken(request)) {
+    return textRes("Unauthorized", 401);
   }
 
   const existingData: UserData | null = await env.BETTER_INTRA_KV.get(
@@ -214,48 +139,8 @@ async function route(request: Request, env: Env): Promise<Response> {
     return handlePublicVisuals(request, existingData);
   }
 
-  if (url.pathname === "/api/v1/students") {
-    return handleStudentsList(request, env, origin, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/future-students") {
-    return handleFutureStudentsList(
-      request,
-      env,
-      origin,
-      loginParam,
-      existingData,
-    );
-  }
-
-  if (url.pathname === "/api/v1/pisciners") {
-    return handlePiscinersList(
-      request,
-      env,
-      origin,
-      loginParam,
-      existingData,
-    );
-  }
-
-  if (url.pathname === "/api/v1/piscines") {
-    return handlePiscinesList(request, env, origin, loginParam, existingData);
-  }
-
   if (url.pathname === "/api/v1/private/settings") {
     return handlePrivateSettings(request, env, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/private/friends/data") {
-    return handleFriendsData(request, env, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/private/proxy") {
-    return handleProxy(request, env, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/private/evaluations") {
-    return handleEvaluations(request, env, loginParam, existingData);
   }
 
   if (url.pathname === "/api/v1/private/subjects/report") {
@@ -266,44 +151,10 @@ async function route(request: Request, env: Env): Promise<Response> {
     return handleSubjectsState(request, env, loginParam, existingData);
   }
 
-  if (url.pathname === "/api/v1/private/outstanding") {
-    return handleOutstanding(request, env, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/private/discord/link") {
-    return handleDiscordLink(request, env, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/private/discord/unlink") {
-    return handleDiscordUnlink(request, env, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/private/discord/quiet") {
-    return handleDiscordQuiet(request, env, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/private/profile-stats") {
-    if (request.method !== "GET") return textRes("Method not allowed", 405);
-    const target = url.searchParams.get("target");
-    if (!target) return textRes("Missing target parameter", 400);
-    return handleProfileStats(request, env, loginParam, existingData, target);
-  }
-
   if (url.pathname === "/api/v1/private/calendar/token") {
     return handleCalendarToken(request, env, loginParam, existingData);
   }
 
-  if (url.pathname === "/api/v1/private/calendar/update") {
-    return handleCalendarUpdate(request, env, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/private/logtime/history") {
-    return handleLogtimeHistory(request, env, loginParam, existingData);
-  }
-
-  if (url.pathname === "/api/v1/private/image-upload") {
-    return handleImageUpload(request, env, loginParam, existingData);
-  }
-
-  return textRes("Not found", 404);
+  // USER_ROUTES leaves only /api/v1/private/calendar/update here
+  return handleCalendarUpdate(request, env, loginParam, existingData);
 }

@@ -8,6 +8,7 @@ import {
   type Jwk,
 } from "../src/handlers/intra-auth";
 import type { Env } from "../src/types";
+import { LIMITS, resetRateLimits } from "../src/rate-limit";
 
 // Node 20+ exposes WebCrypto globally, like the Workers runtime does.
 const subtle = crypto.subtle;
@@ -138,6 +139,7 @@ describe("handleIntraAuth JWKS handling", () => {
     vi.useFakeTimers();
     vi.setSystemTime(now);
     resetJwksRefreshThrottle();
+    resetRateLimits();
     fetchMock = vi.fn(async () => new Response(JSON.stringify({ keys: jwks }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
   });
@@ -272,5 +274,81 @@ describe("handleIntraAuth JWKS handling", () => {
     expect(res.status).toBe(200);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(JSON.parse(kv.get("INTRA_JWKS_CACHE")!)).toEqual(jwks);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleIntraAuth: rate limits
+// ---------------------------------------------------------------------------
+
+describe("handleIntraAuth rate limits", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    resetJwksRefreshThrottle();
+    resetRateLimits();
+    fetchMock = vi.fn(async () => new Response(JSON.stringify({ keys: jwks }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  const fromIp = (token: string, ip: string) =>
+    new Request("https://worker.test/auth/intra", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "CF-Connecting-IP": ip },
+      body: JSON.stringify({ token }),
+    });
+
+  it("caps sign-ins per login: a replayed valid token stops writing after the limit", async () => {
+    const { env, puts } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    const token = await sign(validPayload(), privateKey);
+    for (let i = 0; i < LIMITS.write.limit; i++) {
+      expect((await handleIntraAuth(authRequest(token), env)).status).toBe(200);
+    }
+    const writes = puts.length;
+    const res = await handleIntraAuth(authRequest(token), env);
+    expect(res.status).toBe(429);
+    expect(res.headers.get("Retry-After")).toBe("60");
+    expect(puts.length).toBe(writes);
+
+    // another student is not affected
+    const other = await sign({ ...validPayload(), preferred_username: "bob" }, privateKey);
+    expect((await handleIntraAuth(authRequest(other), env)).status).toBe(200);
+
+    // and the window passes
+    vi.setSystemTime(now + LIMITS.write.periodMs + 1);
+    const later = await sign({ ...validPayload(), exp: Math.floor(now / 1000) + 3600 }, privateKey);
+    expect((await handleIntraAuth(authRequest(later), env)).status).toBe(200);
+  });
+
+  it("caps well-formed garbage per IP before any JWKS work", async () => {
+    const { env } = makeEnv({ INTRA_JWKS_CACHE: otherJwks });
+    const getSpy = vi.spyOn(env.BETTER_INTRA_KV, "get");
+    const { priv: attackerKey } = await makeKey("x");
+    const forged = await sign(validPayload(), attackerKey, "k-unknown");
+    for (let i = 0; i < LIMITS.anon.limit; i++) {
+      expect((await handleIntraAuth(fromIp(forged, "10.0.0.1"), env)).status).toBe(401);
+    }
+    const reads = getSpy.mock.calls.length;
+    expect((await handleIntraAuth(fromIp(forged, "10.0.0.1"), env)).status).toBe(429);
+    expect(getSpy.mock.calls.length).toBe(reads);
+    // a different address still gets through to the verification
+    expect((await handleIntraAuth(fromIp(forged, "10.0.0.2"), env)).status).toBe(401);
+  });
+
+  it("never refuses for a missing address (local dev) and forged tokens cost no write", async () => {
+    const { env, puts } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    const { priv: attackerKey } = await makeKey("x");
+    const forged = await sign(validPayload(), attackerKey, "k1");
+    for (let i = 0; i < LIMITS.anon.limit + 5; i++) {
+      expect((await handleIntraAuth(authRequest(forged), env)).status).toBe(401);
+    }
+    expect(puts).toEqual([]);
   });
 });

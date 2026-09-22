@@ -111,11 +111,19 @@ export class FakeKV {
     }
   }
 
-  async get(key: string, opts?: { type?: string } | string): Promise<unknown> {
-    const raw = this.data.get(key);
-    if (raw === undefined) return null;
+  async get(
+    key: string | string[],
+    opts?: { type?: string } | string,
+  ): Promise<unknown> {
     const type = typeof opts === "string" ? opts : opts?.type;
-    return type === "json" ? JSON.parse(raw) : raw;
+    const one = (k: string) => {
+      const raw = this.data.get(k);
+      if (raw === undefined) return null;
+      return type === "json" ? JSON.parse(raw) : raw;
+    };
+    // Bulk form, like KV: a Map with null for the keys that do not exist
+    if (Array.isArray(key)) return new Map(key.map((k) => [k, one(k)]));
+    return one(key);
   }
 
   async put(key: string, value: string): Promise<void> {
@@ -135,6 +143,23 @@ export class FakeKV {
   }
 }
 
+/**
+ * Stand-in for a Workers rate limit binding: counts calls per key and refuses
+ * past `limit`, or refuses everything when `denyAll` is set.
+ */
+export class FakeRateLimit {
+  readonly calls: string[] = [];
+  denyAll = false;
+
+  constructor(readonly max = Infinity) {}
+
+  async limit({ key }: { key: string }): Promise<{ success: boolean }> {
+    this.calls.push(key);
+    if (this.denyAll) return { success: false };
+    return { success: this.calls.filter((k) => k === key).length <= this.max };
+  }
+}
+
 export function makeEnv(
   opts: { kv?: FakeKV; d1?: FakeD1; vars?: Partial<Env> } = {},
 ): { env: Env; kv: FakeKV; d1: FakeD1 } {
@@ -143,8 +168,6 @@ export function makeEnv(
   const env = {
     BETTER_INTRA_KV: kv,
     better_intra_d1: d1,
-    CLIENT_ID: "TO_FILL_42_APP_UID",
-    CLIENT_SECRET: "",
     ...opts.vars,
   } as unknown as Env;
   return { env, kv, d1 };

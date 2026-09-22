@@ -66,7 +66,13 @@ export async function handleAnnouncement(
     } catch {
       return textRes("Invalid JSON", 400);
     }
-    if (typeof body?.secret !== "string" || body.secret !== env.ANNOUNCEMENT_SECRET) {
+    // The secret only ever travels in a JSON body: a query string would sit
+    // in Workers Logs for the retention window. Unset secret = route closed.
+    if (
+      !env.ANNOUNCEMENT_SECRET ||
+      typeof body?.secret !== "string" ||
+      body.secret !== env.ANNOUNCEMENT_SECRET
+    ) {
       return textRes("Forbidden", 403);
     }
 
@@ -75,6 +81,7 @@ export async function handleAnnouncement(
       return textRes(`Message too long (max ${MAX_MESSAGE_LENGTH})`, 400);
     }
 
+    // An empty message is the one way to clear the banner
     if (message === "") {
       await env.BETTER_INTRA_KV.delete(ANNOUNCEMENT_KEY);
       return jsonRes({ message: null });
@@ -87,15 +94,6 @@ export async function handleAnnouncement(
       JSON.stringify({ message, updatedAt: Date.now(), level, links }),
     );
     return jsonRes({ message, level, links });
-  }
-
-  if (request.method === "DELETE") {
-    const url = new URL(request.url);
-    if (url.searchParams.get("secret") !== env.ANNOUNCEMENT_SECRET) {
-      return textRes("Forbidden", 403);
-    }
-    await env.BETTER_INTRA_KV.delete(ANNOUNCEMENT_KEY);
-    return jsonRes({ message: null });
   }
 
   return textRes("Method not allowed", 405);

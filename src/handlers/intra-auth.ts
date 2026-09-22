@@ -13,6 +13,7 @@
  *   -> { "token": "<session token>", "login": "<intra login>" }
  */
 import { Env, UserData } from "../types";
+import { rateLimited, tooManyRes } from "../rate-limit";
 import { getTokens, hashLogin, jsonRes, textRes } from "../utils";
 
 export const INTRA_ISSUER = "https://auth.42.fr/auth/realms/students-42";
@@ -262,6 +263,11 @@ export async function handleIntraAuth(
   if (!decoded || !checkClaims(decoded, now)) {
     return textRes("Invalid or expired Intra token", 401);
   }
+  // Per IP, before any JWKS work: well-formed garbage must not turn into a
+  // stream of key lookups (see src/rate-limit.ts for the limits).
+  if (await rateLimited(env, "anon", request.headers.get("CF-Connecting-IP"))) {
+    return tooManyRes();
+  }
 
   let sets: KeySets;
   try {
@@ -274,10 +280,14 @@ export async function handleIntraAuth(
   // Nothing is written before this point: a forged or invalid token never
   // costs a KV write.
   if (!verified) return textRes("Invalid or expired Intra token", 401);
-  await storeJwks(env, sets);
 
   const rawLogin = verified.login;
   const hashedLogin = await hashLogin(rawLogin);
+  // Per login, once the token is known to be theirs: a student replaying
+  // their own valid token in a loop would otherwise spend a KV write and a
+  // D1 write per call out of the budget shared by every user.
+  if (await rateLimited(env, "write", hashedLogin)) return tooManyRes();
+  await storeJwks(env, sets);
   const newSessionToken = crypto.randomUUID();
   const existing: UserData =
     (await env.BETTER_INTRA_KV.get(hashedLogin, { type: "json" })) || {};

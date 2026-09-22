@@ -1,11 +1,10 @@
 import { Env, UserData } from "../types";
 import {
   fetchAllowed,
-  getBearerToken,
   jsonRes,
   readBodyCapped,
+  requireSession,
   textRes,
-  validateSession,
 } from "../utils";
 
 /**
@@ -171,12 +170,8 @@ export async function handleSubjectsReport(
 ): Promise<Response> {
   if (request.method !== "POST") return textRes("Method not allowed", 405);
 
-  const authHeader = getBearerToken(request);
-  if (!authHeader) return textRes("Missing Authorization Token", 401);
-  if (!existingData) return textRes("User not found", 404);
-  if (!validateSession(existingData, authHeader)) {
-    return textRes("Unauthorized: Invalid Session Token", 401);
-  }
+  const denied = requireSession(request, existingData);
+  if (denied) return denied;
 
   let body: { items?: any[] };
   try {
@@ -292,12 +287,8 @@ export async function handleSubjectsState(
 ): Promise<Response> {
   if (request.method !== "GET") return textRes("Method not allowed", 405);
 
-  const authHeader = getBearerToken(request);
-  if (!authHeader) return textRes("Missing Authorization Token", 401);
-  if (!existingData) return textRes("User not found", 404);
-  if (!validateSession(existingData, authHeader)) {
-    return textRes("Unauthorized: Invalid Session Token", 401);
-  }
+  const denied = requireSession(request, existingData);
+  if (denied) return denied;
 
   const raw = new URL(request.url).searchParams.get("slugs") ?? "";
   const slugs = raw

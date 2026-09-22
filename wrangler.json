@@ -15,16 +15,20 @@
       "database_id": "93d714a6-f83a-4aa3-be0e-3a09d6277035"
     }
   ],
-  "vars": {
-    "CLIENT_ID": "TO_FILL_42_APP_UID",
-    "DISCORD_ENABLED": "false"
-  },
+  "ratelimits": [
+    {
+      "name": "WRITE_RL",
+      "namespace_id": "1001",
+      "simple": { "limit": 10, "period": 60 }
+    },
+    {
+      "name": "ANON_RL",
+      "namespace_id": "1002",
+      "simple": { "limit": 30, "period": 60 }
+    }
+  ],
   "triggers": {
-    "crons": [
-      "*/10 * * * *",
-      "* * * * *",
-      "0 22,4,10,16 * * *"
-    ]
+    "crons": []
   },
   "observability": {
     "enabled": false,
@@ -33,7 +37,7 @@
       "enabled": true,
       "head_sampling_rate": 1,
       "persist": true,
-      "invocation_logs": true
+      "invocation_logs": false
     },
     "traces": {
       "enabled": false,

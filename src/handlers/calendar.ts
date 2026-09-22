@@ -1,10 +1,13 @@
 import { Env, UserData } from "../types";
-import {
-  getBearerToken,
-  jsonRes,
-  textRes,
-  validateSession,
-} from "../utils";
+import { rateLimited, tooManyRes } from "../rate-limit";
+import { jsonRes, readJsonBody, requireSession, textRes } from "../utils";
+
+/**
+ * A full year of Intra events is a few tens of KB of ICS. D1 refuses rows past
+ * 2 MB with an unhandled error, and the stored body is served to every
+ * calendar client every hour, so anything past this is a wrong client.
+ */
+export const MAX_ICS_BYTES = 256 * 1024;
 
 /**
  * Calendar links (/calendar/<token>.ics) live in D1, one live token per
@@ -118,22 +121,21 @@ export async function handleCalendarToken(
 ): Promise<Response> {
   if (request.method !== "POST") return textRes("Method not allowed", 405);
 
-  const authHeader = getBearerToken(request);
-  if (!authHeader) return textRes("Missing Authorization header", 401);
-  if (!existingData) return textRes("User not found", 404);
-  if (!validateSession(existingData, authHeader)) return textRes("Invalid session", 401);
+  const denied = requireSession(request, existingData);
+  if (denied) return denied;
+  const record = existingData as UserData;
 
-  let body: { token?: string };
-  try {
-    body = await request.json();
-  } catch {
-    return textRes("Invalid JSON body", 400);
-  }
+  const body = await readJsonBody<{ token?: unknown }>(
+    request,
+    4096,
+    "Body too large",
+  );
+  if (!body.ok) return body.response;
 
-  if (typeof body?.token !== "string" || !NEW_TOKEN_RE.test(body.token)) {
+  const token = body.value?.token;
+  if (typeof token !== "string" || !NEW_TOKEN_RE.test(token)) {
     return textRes("Invalid token", 400);
   }
-  const token = body.token;
 
   await ensureTokensTable(env);
   const db = env.better_intra_d1;
@@ -158,10 +160,12 @@ export async function handleCalendarToken(
     return textRes("Token already in use", 409);
   }
 
+  if (await rateLimited(env, "write", loginParam)) return tooManyRes();
+
   const legacy = await legacyRetirement(
     env,
     loginParam,
-    existingData.settings,
+    record.settings,
     token,
   );
   await db.batch([
@@ -222,27 +226,28 @@ export async function handleCalendarUpdate(
 ): Promise<Response> {
   if (request.method !== "POST") return textRes("Method not allowed", 405);
 
-  const authHeader = getBearerToken(request);
-  if (!authHeader) return textRes("Missing Authorization header", 401);
-  if (!existingData) return textRes("User not found", 404);
-  if (!validateSession(existingData, authHeader)) return textRes("Invalid session", 401);
+  const denied = requireSession(request, existingData);
+  if (denied) return denied;
 
-  let body: { ics?: string };
-  try {
-    body = await request.json();
-  } catch {
-    return textRes("Invalid JSON body", 400);
-  }
+  const body = await readJsonBody<{ ics?: unknown }>(
+    request,
+    MAX_ICS_BYTES,
+    `Calendar too large (max ${MAX_ICS_BYTES / 1024} KB)`,
+  );
+  if (!body.ok) return body.response;
 
-  if (!body.ics || typeof body.ics !== "string" || body.ics.length < 50) {
+  const ics = body.value?.ics;
+  if (typeof ics !== "string" || ics.length < 50) {
     return textRes("Invalid ics body", 400);
   }
+
+  if (await rateLimited(env, "write", loginParam)) return tooManyRes();
 
   await env.better_intra_d1
     .prepare(
       "INSERT OR REPLACE INTO calendar_ics (login_hash, ics_body, updated_at) VALUES (?, ?, unixepoch())",
     )
-    .bind(loginParam, body.ics)
+    .bind(loginParam, ics)
     .run();
 
   return jsonRes({ ok: true });

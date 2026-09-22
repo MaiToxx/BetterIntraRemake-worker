@@ -1,12 +1,20 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import {
   handleCalendarIcs,
   handleCalendarToken,
   handleCalendarUpdate,
+  MAX_ICS_BYTES,
 } from "../src/handlers/calendar";
 import { handlePrivateSettings } from "../src/handlers/settings";
 import type { Env, UserData } from "../src/types";
 import { FakeD1, FakeKV, makeEnv } from "./helpers/fake-env";
+import { LIMITS, resetRateLimits } from "../src/rate-limit";
+
+// The in-isolate write limiter is keyed by login and every test here writes
+// as the same two logins.
+beforeEach(() => {
+  resetRateLimits();
+});
 
 const ALICE = "a".repeat(64);
 const BOB = "b".repeat(64);
@@ -296,5 +304,58 @@ describe("calendar_tokens table", () => {
     expect(await feed(env, LEGACY)).toEqual({ status: 200, body: ICS_ALICE });
     expect((await register(env, ALICE, T1)).status).toBe(200);
     expect(await feed(env, T1)).toEqual({ status: 200, body: ICS_ALICE });
+  });
+});
+
+describe("private calendar routes", () => {
+  const snapshot = async (res: Response) => ({
+    status: res.status,
+    body: await res.text(),
+    headers: [...res.headers.entries()].sort(),
+  });
+
+  it("answer the same 401 for a missing header, an unknown login and a wrong token", async () => {
+    const { env } = setup();
+    const carol = "c".repeat(64);
+    const bodies = { token: JSON.stringify({ token: T1 }), update: JSON.stringify({ ics: ICS_ALICE }) };
+    for (const [path, handler, body] of [
+      ["calendar/token", handleCalendarToken, bodies.token],
+      ["calendar/update", handleCalendarUpdate, bodies.update],
+    ] as const) {
+      const req = (login: string, auth?: string) =>
+        new Request(`https://w.test/api/v1/private/${path}?login=${login}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...(auth ? { Authorization: `Bearer ${auth}` } : {}) },
+          body,
+        });
+      const noHeader = await snapshot(await handler(req(ALICE), env, ALICE, await userData(env, ALICE)));
+      expect(noHeader.status).toBe(401);
+      expect(await snapshot(await handler(req(carol, "x"), env, carol, null))).toEqual(noHeader);
+      expect(await snapshot(await handler(req(ALICE, "forged"), env, ALICE, await userData(env, ALICE)))).toEqual(noHeader);
+    }
+  });
+
+  it("refuses a calendar over the cap with 413 before any D1 statement", async () => {
+    const { env, d1 } = setup();
+    const huge = ["BEGIN:VCALENDAR", "X:".padEnd(MAX_ICS_BYTES, "a"), "END:VCALENDAR"].join("\r\n");
+    const res = await upload(env, ALICE, huge);
+    expect(res.status).toBe(413);
+    expect(await res.text()).toMatch(/too large/i);
+    expect(d1.prepared).toEqual([]);
+    // a real-sized one still goes through
+    expect((await upload(env, ALICE, ICS_ALICE)).status).toBe(200);
+  });
+
+  it("rate-limits uploads per login, without touching D1 past the limit", async () => {
+    const { env, d1 } = setup();
+    for (let i = 0; i < LIMITS.write.limit; i++) {
+      expect((await upload(env, ALICE, `${ICS_ALICE}${i}`)).status).toBe(200);
+    }
+    const statements = d1.prepared.length;
+    const res = await upload(env, ALICE, ICS_ALICE);
+    expect(res.status).toBe(429);
+    expect(d1.prepared.length).toBe(statements);
+    // bob has his own budget
+    expect((await upload(env, BOB, ICS_BOB)).status).toBe(200);
   });
 });

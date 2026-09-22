@@ -233,4 +233,44 @@ describe("handlePublicVisuals", () => {
   it("rejects other methods", async () => {
     expect((await handlePublicVisuals(req("POST"), null)).status).toBe(405);
   });
+
+  it("never re-serves an oversize or ill-typed stored value", async () => {
+    const res = await handlePublicVisuals(req(), {
+      settings: {
+        PROFILE_IMAGE_URL: "https://x/" + "a".repeat(5 * 1024 * 1024),
+        PROFILE_BANNER_URL: "https://x/" + "b".repeat(2048 - 10),
+        PROFILE_BACKGROUND_URL: "https://x/" + "c".repeat(2048 - 9),
+        PROFILE_BANNER_MODE: "m".repeat(65),
+        PROFILE_AVATAR_BG: 12,
+        PROFILE_BANNER_COLOR: "#123456",
+        PROFILE_AVATAR_POSITION_X: "NaN",
+        PROFILE_AVATAR_SCALE: "120",
+        LOGTIME_EMOJI: "e".repeat(65),
+        LOGTIME_LABELS_COLOR: "#abcdef",
+        LOGTIME_EMOJI_RATE: "3",
+        LOGTIME_EMOJI_DIVISOR: 4,
+      },
+    });
+    const text = await res.text();
+    expect(text.length).toBeLessThan(8 * 1024);
+    const body = JSON.parse(text) as Record<string, any>;
+    expect(body.avatar).toBe("");
+    // 2048 characters pass, 2049 do not
+    expect(body.banner).toHaveLength(2048);
+    expect(body.background).toBe("");
+    expect(body.bannerMode).toBe("fill");
+    expect(body.avatarBg).toBe("transparent");
+    expect(body.bannerColor).toBe("#123456");
+    expect(body.avatarPosX).toBe(50);
+    expect(body.avatarScale).toBe(120);
+    expect(body.logtime.emoji).toBeUndefined();
+    expect(body.logtime.labelsColor).toBe("#abcdef");
+    expect(body.logtime.emojiRate).toBeUndefined();
+    expect(body.logtime.emojiDivisor).toBe(4);
+  });
+
+  it("lets the browser cache the answer for five minutes", async () => {
+    const res = await handlePublicVisuals(req(), null);
+    expect(res.headers.get("Cache-Control")).toBe("public, max-age=300");
+  });
 });
