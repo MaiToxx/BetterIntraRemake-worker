@@ -9,6 +9,8 @@ import {
 } from "../src/handlers/intra-auth";
 import type { Env } from "../src/types";
 import { LIMITS, resetRateLimits } from "../src/rate-limit";
+import { hashLogin } from "../src/utils";
+import { FakeD1 } from "./helpers/fake-env";
 
 // Node 20+ exposes WebCrypto globally, like the Workers runtime does.
 const subtle = crypto.subtle;
@@ -350,5 +352,64 @@ describe("handleIntraAuth rate limits", () => {
       expect((await handleIntraAuth(authRequest(forged), env)).status).toBe(401);
     }
     expect(puts).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleIntraAuth: the users row (community counter)
+// ---------------------------------------------------------------------------
+
+describe("handleIntraAuth users row", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    resetJwksRefreshThrottle();
+    resetRateLimits();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ keys: jwks }), { status: 200 })));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /** A sign-in request as Cloudflare delivers it, with the IP's country. */
+  const fromFrance = (token: string) => {
+    const req = authRequest(token);
+    Object.defineProperty(req, "cf", { value: { country: "FR" } });
+    return req;
+  };
+
+  it("answers the session even when the users row cannot be written", async () => {
+    const { env, kv } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    (env as { better_intra_d1: unknown }).better_intra_d1 = {
+      prepare: () => {
+        throw new Error("D1_ERROR: Network connection lost.");
+      },
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await handleIntraAuth(fromFrance(await sign(validPayload(), privateKey)), env);
+    expect(res.status).toBe(200);
+    const { token } = (await res.json()) as { token: string };
+    // the token the extension receives is the one stored, and it is the only one
+    const record = JSON.parse(kv.get(await hashLogin("alepayen"))!);
+    expect(record.sessionTokens).toEqual([token]);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("users row"));
+  });
+
+  it("stores the login hash and the date only, never the country, and writes once", async () => {
+    const { env } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    const d1 = new FakeD1();
+    (env as { better_intra_d1: unknown }).better_intra_d1 = d1;
+    const hash = await hashLogin("alepayen");
+
+    expect((await handleIntraAuth(fromFrance(await sign(validPayload(), privateKey)), env)).status).toBe(200);
+    const first = d1.rows("SELECT hash, country, created_at FROM users");
+    expect(first).toEqual([{ hash, country: null, created_at: expect.any(Number) }]);
+
+    expect((await handleIntraAuth(fromFrance(await sign(validPayload(), privateKey)), env)).status).toBe(200);
+    expect(d1.rows("SELECT hash, country, created_at FROM users")).toEqual(first);
+    for (const sql of d1.prepared) expect(sql).not.toMatch(/country/i);
   });
 });

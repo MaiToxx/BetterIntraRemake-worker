@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/types";
-import { FakeKV, makeEnv } from "./helpers/fake-env";
+import { FakeKV, FakeRateLimit, makeEnv } from "./helpers/fake-env";
+import { LIMITS, resetRateLimits } from "../src/rate-limit";
 
 const LOGIN = "d".repeat(64);
 const OTHER = "e".repeat(64);
@@ -266,6 +267,56 @@ describe("batch public visuals", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("Cache-Control")).toBe("public, max-age=300");
     expect(((await res.json()) as { avatar: string }).avatar).toBe("");
+  });
+});
+
+describe("batch public visuals: per-IP limit", () => {
+  beforeEach(() => resetRateLimits());
+
+  // 50 made-up hashes: what an attacker sends to spend 50 KV reads a call
+  const random = Array.from({ length: 50 }, (_, i) =>
+    (i + 1).toString(16).padStart(64, "0"),
+  ).join(",");
+  const batch = (env: Env, ip: string | null) =>
+    worker.fetch(
+      new Request(`https://w.test/api/v1/public/visuals?logins=${random}`, {
+        headers: ip ? { "CF-Connecting-IP": ip } : {},
+      }),
+      env,
+    );
+
+  it("answers 429 past the limit from one address, before any KV read; other addresses go on", async () => {
+    const { env, kv } = seeded();
+    const getSpy = vi.spyOn(kv, "get");
+    for (let i = 0; i < LIMITS.visuals.limit; i++) {
+      expect((await batch(env, "203.0.113.7")).status).toBe(200);
+    }
+    const reads = getSpy.mock.calls.length;
+    const refused = await batch(env, "203.0.113.7");
+    expect(refused.status).toBe(429);
+    expect(refused.headers.get("Retry-After")).toBe("60");
+    expect(refused.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(getSpy.mock.calls.length).toBe(reads);
+
+    expect((await batch(env, "198.51.100.1")).status).toBe(200);
+    // the single-login form (one read a call) is not limited
+    const single = await worker.fetch(
+      new Request(`https://w.test/api/v1/public/visuals?login=${LOGIN}`, {
+        headers: { "CF-Connecting-IP": "203.0.113.7" },
+      }),
+      env,
+    );
+    expect(single.status).toBe(200);
+  });
+
+  it("uses the VISUALS_RL binding when bound, keyed by address", async () => {
+    const visuals = new FakeRateLimit();
+    visuals.denyAll = true;
+    const { env, kv } = seeded({ VISUALS_RL: visuals });
+    const getSpy = vi.spyOn(kv, "get");
+    expect((await batch(env, "203.0.113.7")).status).toBe(429);
+    expect(visuals.calls).toEqual(["203.0.113.7"]);
+    expect(getSpy).not.toHaveBeenCalled();
   });
 });
 

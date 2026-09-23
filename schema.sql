@@ -1,8 +1,10 @@
 -- One row per student who ever signed in (src/handlers/intra-auth.ts):
--- the login hash, the two-letter country Cloudflare inferred from the IP of
--- the first sign-in (request.cf.country, never updated) and the date. Read
--- only by /api/v1/public/stats (community counter in the hub About tab) and
--- deleted by "Wipe all data". A database created by an earlier schema also
+-- the login hash and the date of the first sign-in. Read only by
+-- /api/v1/public/stats (community counter in the hub About tab) and deleted
+-- by "Wipe all data". `country` is no longer written (rows made before
+-- that may still hold the two-letter country of their first sign-in until
+-- the operator runs `UPDATE users SET country = NULL`); the column stays so
+-- no migration is needed. A database created by an earlier schema also
 -- carries 42-application columns (forty_two_token, evals_enabled, campus_*,
 -- pool...) that nothing reads any more.
 CREATE TABLE IF NOT EXISTS users (

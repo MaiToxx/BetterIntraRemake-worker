@@ -25,6 +25,11 @@
       "name": "ANON_RL",
       "namespace_id": "1002",
       "simple": { "limit": 30, "period": 60 }
+    },
+    {
+      "name": "VISUALS_RL",
+      "namespace_id": "1003",
+      "simple": { "limit": 120, "period": 60 }
     }
   ],
   "triggers": {

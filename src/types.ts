@@ -8,6 +8,7 @@ export interface Env {
    */
   WRITE_RL?: RateLimit;
   ANON_RL?: RateLimit;
+  VISUALS_RL?: RateLimit;
   ANNOUNCEMENT_SECRET?: string;
 }
 

@@ -3,6 +3,7 @@ import {
   handlePrivateSettings,
   MAX_SETTING_STRING,
   MAX_SETTINGS_BYTES,
+  type TooLargeBody,
 } from "../src/handlers/settings";
 import { LIMITS, resetRateLimits } from "../src/rate-limit";
 import type { Env, UserData } from "../src/types";
@@ -120,14 +121,29 @@ describe("settings POST", () => {
 });
 
 describe("settings POST size caps", () => {
+  /** What a 413 must carry for the extension to name the culprit. */
+  async function tooLarge(res: Response): Promise<TooLargeBody> {
+    expect(res.status).toBe(413);
+    expect(res.headers.get("Content-Type")).toBe("application/json");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    const body = (await res.json()) as TooLargeBody;
+    expect(body.error).toBe("too_large");
+    expect(body.message).toMatch(/too large/i);
+    return body;
+  }
+
   it("refuses a body over the cap with 413 and no KV write", async () => {
     const { env, kv } = setup({});
     const res = await push(env, {
       CUSTOM_CSS: "a".repeat(MAX_SETTING_STRING),
-      HISTORY: Array.from({ length: 80 }, (_, i) => "u".repeat(1000) + i),
+      HISTORY: Array.from({ length: Math.ceil(MAX_SETTINGS_BYTES / 1000) }, (_, i) => "u".repeat(1000) + i),
     });
-    expect(res.status).toBe(413);
-    expect(await res.text()).toMatch(/too large/i);
+    expect(await tooLarge(res)).toEqual({
+      error: "too_large",
+      key: null,
+      max: MAX_SETTINGS_BYTES,
+      message: "Settings too large (max 256 KB)",
+    });
     expect(kv.puts).toEqual([]);
   });
 
@@ -146,18 +162,22 @@ describe("settings POST size caps", () => {
       },
     );
     const res = await handlePrivateSettings(req, env, LOGIN, await existing(env));
-    expect(res.status).toBe(413);
+    expect((await tooLarge(res)).key).toBeNull();
     expect(kv.puts).toEqual([]);
   });
 
-  it("refuses a single value over 8 KB but stores one just under", async () => {
+  it("refuses a single value over the string cap, naming it, but stores one at the cap", async () => {
     const { env, kv } = setup({});
     const over = await push(env, {
       A: 1,
       PROFILE_IMAGE_URL: "https://x/" + "a".repeat(MAX_SETTING_STRING),
     });
-    expect(over.status).toBe(413);
-    expect(await over.text()).toContain("PROFILE_IMAGE_URL");
+    expect(await tooLarge(over)).toEqual({
+      error: "too_large",
+      key: "PROFILE_IMAGE_URL",
+      max: MAX_SETTING_STRING,
+      message: "Setting PROFILE_IMAGE_URL too large (max 64 KB)",
+    });
     expect(kv.puts).toEqual([]);
 
     const css = "b".repeat(MAX_SETTING_STRING);
@@ -165,12 +185,37 @@ describe("settings POST size caps", () => {
     expect(kv.json(LOGIN).settings.CUSTOM_CSS).toBe(css);
   });
 
-  it("refuses to top an existing record up past the cap one key at a time", async () => {
+  it("stores what real students push: a 20 KB stylesheet, and 20 presets over a 3 KB one", async () => {
+    const { env, kv } = setup({});
+    const css = "/* long theme */ .card { color: red } ".repeat(540); // ~20 KB
+    expect(css.length).toBeGreaterThan(20_000);
+    expect((await push(env, { CUSTOM_CSS: css })).status).toBe(200);
+
+    // each preset snapshots every Customize key, the stylesheet included
+    const small = "a { color: blue } ".repeat(170); // ~3 KB
+    const presets = Array.from({ length: 20 }, (_, i) => ({
+      name: `Preset ${i}`,
+      values: { CUSTOM_CSS: small, CUSTOM_ACCENT_COLOR: "#ff00aa", filler: "x".repeat(850) },
+    }));
+    // over the 64 KB that used to refuse the whole push
+    expect(JSON.stringify(presets).length).toBeGreaterThan(64 * 1024);
+    const res = await push(env, { CUSTOM_CSS: small, CUSTOM_PRESETS: presets });
+    expect(res.status).toBe(200);
+    expect(kv.json(LOGIN).settings.CUSTOM_PRESETS).toHaveLength(20);
+  });
+
+  it("refuses to top an existing record up past the cap one key at a time, naming the largest key", async () => {
     const big: Record<string, string> = {};
-    for (let i = 0; i < 8; i++) big[`K${i}`] = "x".repeat(MAX_SETTING_STRING - 100);
+    const fits = Math.floor(MAX_SETTINGS_BYTES / MAX_SETTING_STRING);
+    for (let i = 0; i < fits; i++) big[`K${i}`] = "x".repeat(MAX_SETTING_STRING - 100 - i);
     const { env, kv } = setup(big);
-    const res = await push(env, { K9: "y".repeat(MAX_SETTING_STRING - 100) });
-    expect(res.status).toBe(413);
+    const res = await push(env, { K9: "y".repeat(MAX_SETTING_STRING - 50) });
+    expect(await tooLarge(res)).toEqual({
+      error: "too_large",
+      key: "K9",
+      max: MAX_SETTINGS_BYTES,
+      message: "Settings too large (max 256 KB); largest: K9",
+    });
     expect(kv.puts).toEqual([]);
     // an unchanged push of the same big record is still a free no-op
     expect((await push(env, big)).status).toBe(200);

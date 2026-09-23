@@ -98,7 +98,13 @@ async function route(request: Request, env: Env): Promise<Response> {
   const imgMatch = url.pathname.match(/^\/img\/([a-f0-9]{64})\/([a-z]+)$/);
   if (imgMatch) {
     if (request.method !== "GET") return textRes("Method not allowed", 405);
-    return handleImageServe(env, imgMatch[1], imgMatch[2]);
+    return handleImageServe(
+      env,
+      imgMatch[1],
+      imgMatch[2],
+      url.searchParams.get("v"),
+      url.origin,
+    );
   }
 
   const calMatch = url.pathname.match(/^\/calendar\/([^\/]+)\.ics$/);
@@ -160,6 +166,7 @@ async function route(request: Request, env: Env): Promise<Response> {
   }
 
   if (url.pathname === "/api/v1/private/images") {
+    // POST uploads, DELETE removes a slot
     return handleImageUpload(request, env, loginParam, existingData);
   }
 

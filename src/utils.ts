@@ -166,15 +166,19 @@ export type JsonBody<T> =
  * JSON body of a client request, or the response to send instead: 413 past
  * `maxBytes` (the body is dropped as soon as it is over, never buffered
  * whole), 400 when it is not JSON. The cap is in bytes on the wire, which is
- * what the KV record and the D1 row end up holding.
+ * what the KV record and the D1 row end up holding. `tooLarge` is the 413's
+ * text, or a function building the whole response.
  */
 export async function readJsonBody<T = unknown>(
   request: Request,
   maxBytes: number,
-  tooLarge: string,
+  tooLarge: string | (() => Response),
 ): Promise<JsonBody<T>> {
   const bytes = await readBodyCapped(request, maxBytes);
-  if (!bytes) return { ok: false, response: textRes(tooLarge, 413) };
+  if (!bytes) {
+    const response = typeof tooLarge === "string" ? textRes(tooLarge, 413) : tooLarge();
+    return { ok: false, response };
+  }
   try {
     return { ok: true, value: JSON.parse(new TextDecoder().decode(bytes)) as T };
   } catch {

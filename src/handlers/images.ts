@@ -1,6 +1,9 @@
 import { Env, UserData } from "../types";
 import { rateLimited, tooManyRes } from "../rate-limit";
 import { corsHeaders, jsonRes, readBodyCapped, requireSession, textRes } from "../utils";
+import { sniffImageType, stripImageMetadata } from "../image-strip";
+
+export { sniffImageType };
 
 /**
  * Profile images uploaded from the editor, kept in KV: one value per user
@@ -9,9 +12,13 @@ import { corsHeaders, jsonRes, readBodyCapped, requireSession, textRes } from ".
  * wasted on history). This edition has no R2 bucket; KV values go up to
  * 25 MB and the cap here is far below that.
  *
- * Served at GET /img/<hash>/<slot>?v=<n> with a year of cache: the `v` the
- * upload answers changes on every upload, so a replaced image shows at once
- * while the old URL stays cacheable.
+ * Served at GET /img/<hash>/<slot>?v=<n>. The `v` the upload answers changes
+ * on every upload and names one set of bytes: only the URL whose `v` matches
+ * the stored image gets the year of immutable cache. Any other `v` (a
+ * superseded upload saved in a profile or a URL history, or a location whose
+ * KV copy still holds the previous upload) is redirected, uncached, to the
+ * current one, so a URL is never cached with bytes it does not name, and a
+ * saved profile never shows a broken image because it was replaced.
  */
 export const IMAGE_SLOTS = ["avatar", "banner", "background"] as const;
 export type ImageSlot = (typeof IMAGE_SLOTS)[number];
@@ -23,28 +30,7 @@ const KEY_PREFIX = "img:";
 export const imageKey = (loginHash: string, slot: ImageSlot): string =>
   `${KEY_PREFIX}${loginHash}:${slot}`;
 
-/**
- * The image type from the bytes, never from the client's Content-Type: what
- * is served back under image/* must really be an image the browser will
- * only ever draw.
- */
-export function sniffImageType(bytes: Uint8Array): string | null {
-  const at = (i: number) => bytes[i];
-  if (bytes.length >= 8 && at(0) === 0x89 && at(1) === 0x50 && at(2) === 0x4e && at(3) === 0x47)
-    return "image/png";
-  if (bytes.length >= 3 && at(0) === 0xff && at(1) === 0xd8 && at(2) === 0xff) return "image/jpeg";
-  if (bytes.length >= 6 && at(0) === 0x47 && at(1) === 0x49 && at(2) === 0x46 && at(3) === 0x38)
-    return "image/gif";
-  if (
-    bytes.length >= 12 &&
-    at(0) === 0x52 && at(1) === 0x49 && at(2) === 0x46 && at(3) === 0x46 &&
-    at(8) === 0x57 && at(9) === 0x45 && at(10) === 0x42 && at(11) === 0x50
-  )
-    return "image/webp";
-  return null;
-}
-
-interface ImageMeta {
+export interface ImageMeta {
   type: string;
   /** Changes on every upload: the cache-busting `v` of the served URL. */
   v: number;
@@ -54,14 +40,24 @@ export function isImageSlot(value: string | null): value is ImageSlot {
   return (IMAGE_SLOTS as readonly string[]).includes(value ?? "");
 }
 
-/** POST /api/v1/private/images?login=<hash>&slot=<slot>, body: the raw image. */
+export const imagePath = (loginHash: string, slot: ImageSlot, v: number): string =>
+  `/img/${loginHash}/${slot}?v=${v}`;
+
+/**
+ * /api/v1/private/images?login=<hash>&slot=<slot>
+ *  - POST, body: the raw image. Stored without its metadata (location, date,
+ *    device: see src/image-strip.ts); answers {url}.
+ *  - DELETE: removes that slot's image (204, also when there was none).
+ */
 export async function handleImageUpload(
   request: Request,
   env: Env,
   loginParam: string,
   existingData: UserData | null,
 ): Promise<Response> {
-  if (request.method !== "POST") return textRes("Method not allowed", 405);
+  if (request.method !== "POST" && request.method !== "DELETE") {
+    return textRes("Method not allowed", 405);
+  }
   const denied = requireSession(request, existingData);
   if (denied) return denied;
 
@@ -69,24 +65,39 @@ export async function handleImageUpload(
   if (!isImageSlot(slot)) return textRes("Unknown image slot", 400);
   if (await rateLimited(env, "write", loginParam)) return tooManyRes();
 
+  if (request.method === "DELETE") {
+    // One delete, no existence check: a read would buffer up to 2 MB to save
+    // an operation the extension only spends when it knows there is an image.
+    await env.BETTER_INTRA_KV.delete(imageKey(loginParam, slot));
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
+
   const bytes = await readBodyCapped(request, MAX_IMAGE_BYTES);
   if (bytes === null) return textRes("Image too large (2 MB at most)", 413);
   const type = sniffImageType(bytes);
   if (!type) return textRes("Not a PNG, JPEG, GIF or WebP image", 415);
+  // Never the raw bytes: a file that cannot be cleaned is not stored.
+  const clean = stripImageMetadata(bytes, type);
+  if (!clean) return textRes("Could not read this image: save it again, or use another one", 415);
 
   const v = Date.now();
-  await env.BETTER_INTRA_KV.put(imageKey(loginParam, slot), bytes, {
+  await env.BETTER_INTRA_KV.put(imageKey(loginParam, slot), clean, {
     metadata: { type, v } satisfies ImageMeta,
   });
   const origin = new URL(request.url).origin;
-  return jsonRes({ url: `${origin}/img/${loginParam}/${slot}?v=${v}` });
+  return jsonRes({ url: `${origin}${imagePath(loginParam, slot, v)}` });
 }
 
-/** GET /img/<hash>/<slot>: the stored image, public, cached for a year. */
+/**
+ * GET /img/<hash>/<slot>?v=<n>: the stored image, public. Cached for a year
+ * only under the `v` it was uploaded with; see the top of this file.
+ */
 export async function handleImageServe(
   env: Env,
   loginHash: string,
   slot: string,
+  v: string | null,
+  origin: string,
 ): Promise<Response> {
   if (!isImageSlot(slot)) return textRes("Not found", 404);
   const { value, metadata } = await env.BETTER_INTRA_KV.getWithMetadata<ImageMeta>(
@@ -94,11 +105,26 @@ export async function handleImageServe(
     { type: "arrayBuffer" },
   );
   if (!value || !metadata?.type) return textRes("Not found", 404);
+  const current = typeof metadata.v === "number" ? metadata.v : null;
+  if (current !== null && v !== String(current)) {
+    return new Response(null, {
+      status: 302,
+      headers: {
+        ...corsHeaders,
+        Location: `${origin}${imagePath(loginHash, slot, current)}`,
+        // The target changes with the next upload: a cached redirect would
+        // pin this URL to an image it does not name.
+        "Cache-Control": "no-store",
+      },
+    });
+  }
   return new Response(value, {
     headers: {
       ...corsHeaders,
       "Content-Type": metadata.type,
-      "Cache-Control": "public, max-age=31536000, immutable",
+      // Without a stored version there is nothing to pin the bytes to.
+      "Cache-Control":
+        current === null ? "no-cache" : "public, max-age=31536000, immutable",
       // An image is only ever drawn; never a document on this origin.
       "Content-Security-Policy": "default-src 'none'; sandbox",
       "Content-Disposition": "inline",

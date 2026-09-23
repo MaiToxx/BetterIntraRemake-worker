@@ -306,13 +306,20 @@ export async function handleIntraAuth(
     }),
   );
 
-  const country = request.cf?.country || null;
-  await env.better_intra_d1
-    .prepare(
-      "INSERT INTO users (hash, country) VALUES (?, ?) ON CONFLICT(hash) DO UPDATE SET country = COALESCE(users.country, ?)",
-    )
-    .bind(hashedLogin, country, country)
-    .run();
+  // The users row only feeds the community counter (/api/v1/public/stats).
+  // The session is stored by now: a D1 error must not turn a verified
+  // sign-in into a 500, which the extension shows as a failed login while
+  // the new token sits orphaned in the record, and a retry spends another KV
+  // write. No country is kept: nothing the extension does needs one. Only
+  // the first sign-in writes a row.
+  try {
+    await env.better_intra_d1
+      .prepare("INSERT OR IGNORE INTO users (hash) VALUES (?)")
+      .bind(hashedLogin)
+      .run();
+  } catch (e) {
+    console.warn(`[intra-auth] users row insert failed: ${e}`);
+  }
 
   return jsonRes({ token: newSessionToken, login: rawLogin });
 }

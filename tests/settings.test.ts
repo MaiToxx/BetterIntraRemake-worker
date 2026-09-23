@@ -37,6 +37,16 @@ describe("publicLook", () => {
   });
 });
 
+describe("publicLook: the theme preset", () => {
+  it("publishes the theme preset with the look (extension 1.14.0)", () => {
+    expect(publicLook({ CUSTOM_SHARE_LOOK: true, PROFILE_THEME_PRESET: "catppuccin" })).toEqual({
+      PROFILE_THEME_PRESET: "catppuccin",
+    });
+    // private look: not even the theme
+    expect(publicLook({ CUSTOM_SHARE_LOOK: false, PROFILE_THEME_PRESET: "catppuccin" })).toBeNull();
+  });
+});
+
 describe("publicExtras", () => {
   it("publishes by default and returns null once the owner opted out", () => {
     expect(publicExtras({ PROFILE_PUB_BIO: "hello" })).toEqual({ PROFILE_PUB_BIO: "hello" });

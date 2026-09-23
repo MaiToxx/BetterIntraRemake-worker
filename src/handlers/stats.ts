@@ -37,21 +37,15 @@ export async function handleStats(
     countNew(env, 7),
   ]);
 
-  const { results } = await env.better_intra_d1
-    .prepare(
-      "SELECT COALESCE(country, '?') AS country, COUNT(*) AS c FROM users GROUP BY country ORDER BY c DESC",
-    )
-    .all<{ country: string; c: number }>();
-
   return jsonRes({
     total: total?.c ?? 0,
     newToday,
     newLast30Days,
     newLast14Days,
     newLast7Days,
-    countries: (results || []).map((r) => ({
-      country: r.country,
-      count: r.c,
-    })),
+    // No country is stored any more (see handleIntraAuth). The field stays,
+    // empty: extension builds up to 1.13.x read `countries.length` with no
+    // guard, and a missing field would leave their About tab on a spinner.
+    countries: [],
   });
 }

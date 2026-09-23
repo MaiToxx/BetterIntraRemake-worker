@@ -24,7 +24,10 @@ class MockD1 {
     return { c: this.rows.length };
   }
 
+  allCalls = 0;
+
   async all() {
+    this.allCalls++;
     const counts = new Map<string, number>();
     for (const r of this.rows) {
       const key = r.country || "?";
@@ -72,7 +75,7 @@ describe("handleStats", () => {
     });
   });
 
-  it("counts all users and groups by country", async () => {
+  it("counts all users and no longer breaks them down by country", async () => {
     d1.rows = [
       { country: "BE", created_at: NOW - 100 },
       { country: "BE", created_at: NOW - 200 },
@@ -97,11 +100,9 @@ describe("handleStats", () => {
     expect(body.newLast30Days).toBe(4);
     expect(body.newLast14Days).toBe(4);
     expect(body.newLast7Days).toBe(4);
-    expect(body.countries).toEqual([
-      { country: "BE", count: 2 },
-      { country: "FR", count: 1 },
-      { country: "?", count: 1 },
-    ]);
+    // rows stored before the change may still hold a country: never served
+    expect(body.countries).toEqual([]);
+    expect(d1.allCalls).toBe(0);
   });
 
   it("splits the window counts by age", async () => {
@@ -127,6 +128,6 @@ describe("handleStats", () => {
     expect(body.newLast30Days).toBe(3);
     expect(body.newLast14Days).toBe(2);
     expect(body.newLast7Days).toBe(1);
-    expect(body.countries).toHaveLength(4);
+    expect(body.countries).toEqual([]);
   });
 });

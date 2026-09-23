@@ -13,12 +13,15 @@ import {
 } from "../utils";
 
 /**
- * Customize settings a user may publish on their profile (opt-in through
- * CUSTOM_SHARE_LOOK). Presentation only: fonts, size, scrollbar and the
- * free-form CSS never leave their author. The extension validates every
+ * Customize settings a user may publish on their profile, published while
+ * the last push said CUSTOM_SHARE_LOOK: true (the extension's default since
+ * 1.14.0). Presentation only: fonts, size, scrollbar and the free-form CSS
+ * never leave their author. The extension validates every
  * value again before using it.
  */
 export const PUBLIC_LOOK_KEYS = [
+  // the theme preset (a name the extension checks against its own list)
+  "PROFILE_THEME_PRESET",
   "CUSTOM_ACCENT_ENABLED",
   "CUSTOM_ACCENT_COLOR",
   "CUSTOM_ACCENT_GRADIENT",
@@ -51,13 +54,16 @@ const OBJECT_KEYS = new Set<string>(["CUSTOM_CARDS"]);
 /**
  * Bounds of a settings push. The whole record is read on every request that
  * names the user, /api/v1/public/visuals included, so a bloated record slows
- * every visitor of the profile and every friend row. A real record is a few
- * KB; custom CSS and the URL history arrays stay far below 64 KB. No single
- * value needs more than 8 KB: the longest legitimate ones are signed CDN URLs
- * (1-2 KB) and a custom stylesheet.
+ * every visitor of the profile and every friend row: the caps stop abuse,
+ * not real use. A default record is about 4 KB, but real ones are larger:
+ * a custom stylesheet goes past 8 KB, and each saved Customize preset (up to
+ * 20) carries a copy of it, so 20 presets over a 3 KB stylesheet are about
+ * 87 KB. Past a cap the push is refused whole and the student's cloud copy
+ * and public look stop updating, so both leave room: 64 KB for one string
+ * (the stylesheet), 256 KB for the record.
  */
-export const MAX_SETTINGS_BYTES = 64 * 1024;
-export const MAX_SETTING_STRING = 8 * 1024;
+export const MAX_SETTINGS_BYTES = 256 * 1024;
+export const MAX_SETTING_STRING = 64 * 1024;
 
 /** Keep in sync with the extension's public-visuals sanitizer bounds. */
 const MAX_VISUAL_URL = 2048;
@@ -257,9 +263,11 @@ export function parseVisualsLogins(raw: string): string[] | null {
  * GET /api/v1/public/visuals?logins=h1,h2,... -> { visuals: { h1: {...} } }
  *
  * One invocation for the whole friends list instead of one per friend. KV
- * bills one read per key either way: the saving is Worker invocations and
- * browser connections. An unknown hash gets the same defaults as the single
- * form, so the batch says nothing about who has an account.
+ * bills one read per key either way, missing keys included: one call costs
+ * up to 50 reads, so the route is limited per IP ("visuals" bucket, see
+ * src/rate-limit.ts) before the bulk read. An unknown hash gets the same
+ * defaults as the single form, so the batch says nothing about who has an
+ * account.
  */
 export async function handlePublicVisualsBatch(
   request: Request,
@@ -274,6 +282,9 @@ export async function handlePublicVisualsBatch(
       400,
     );
   }
+  if (await rateLimited(env, "visuals", request.headers.get("CF-Connecting-IP"))) {
+    return tooManyRes();
+  }
   const records = await env.BETTER_INTRA_KV.get<UserData>(hashes, {
     type: "json",
   });
@@ -284,23 +295,68 @@ export async function handlePublicVisualsBatch(
   return jsonRes({ visuals }, 200, VISUALS_CACHE);
 }
 
+/**
+ * The 413 of a push, as JSON the extension can act on: `key` names the
+ * setting to shorten (null when the body was refused before it was parsed),
+ * `max` the cap it went over (characters of the string or of the stored
+ * record as JSON, bytes of the request body).
+ */
+export interface TooLargeBody {
+  error: "too_large";
+  key: string | null;
+  max: number;
+  message: string;
+}
+
+function tooLargeRes(key: string | null, max: number, message: string): Response {
+  const body: TooLargeBody = {
+    error: "too_large",
+    key: key === null ? null : key.slice(0, 64),
+    max,
+    message,
+  };
+  return jsonRes(body, 413);
+}
+
+const kb = (bytes: number) => `${bytes / 1024} KB`;
+
+const bodyTooLargeRes = () =>
+  tooLargeRes(null, MAX_SETTINGS_BYTES, `Settings too large (max ${kb(MAX_SETTINGS_BYTES)})`);
+
 /** Response to a push, or null when every value fits. */
 function checkSettingValues(settings: Record<string, unknown>): Response | null {
   for (const [key, value] of Object.entries(settings)) {
     if (typeof value === "string" && value.length > MAX_SETTING_STRING) {
-      return textRes(
-        `Setting ${key.slice(0, 64)} too long (max ${MAX_SETTING_STRING / 1024} KB)`,
-        413,
+      return tooLargeRes(
+        key,
+        MAX_SETTING_STRING,
+        `Setting ${key.slice(0, 64)} too large (max ${kb(MAX_SETTING_STRING)})`,
       );
     }
   }
   return null;
 }
 
-function tooLargeRes(): Response {
-  return textRes(
-    `Settings too large (max ${MAX_SETTINGS_BYTES / 1024} KB)`,
-    413,
+/** The key whose value takes the most room in `settings`, as stored. */
+function largestKey(settings: Record<string, unknown>): string | null {
+  let largest: string | null = null;
+  let size = -1;
+  for (const [key, value] of Object.entries(settings)) {
+    const n = JSON.stringify(value)?.length ?? 0;
+    if (n > size) {
+      largest = key;
+      size = n;
+    }
+  }
+  return largest;
+}
+
+function recordTooLargeRes(settings: Record<string, unknown>): Response {
+  const key = largestKey(settings);
+  return tooLargeRes(
+    key,
+    MAX_SETTINGS_BYTES,
+    `Settings too large (max ${kb(MAX_SETTINGS_BYTES)}); largest: ${key?.slice(0, 64) ?? "?"}`,
   );
 }
 
@@ -336,7 +392,7 @@ export async function handlePrivateSettings(
     const body = await readJsonBody<{ settings?: unknown }>(
       request,
       MAX_SETTINGS_BYTES,
-      `Settings too large (max ${MAX_SETTINGS_BYTES / 1024} KB)`,
+      bodyTooLargeRes,
     );
     if (!body.ok) return body.response;
 
@@ -362,7 +418,7 @@ export async function handlePrivateSettings(
     }
     // The merged record is what gets stored: an existing large record must
     // not be topped up past the cap one small push at a time.
-    if (serialized.length > MAX_SETTINGS_BYTES) return tooLargeRes();
+    if (serialized.length > MAX_SETTINGS_BYTES) return recordTooLargeRes(settingsToSave);
 
     if (await rateLimited(env, "write", loginParam)) return tooManyRes();
 
@@ -380,7 +436,7 @@ export async function handlePrivateSettings(
       // Calendar first, then the D1 rows, then the record: if a step fails
       // the user record, and so the session needed to retry, is still there.
       await deleteCalendarData(env, loginParam, record.settings);
-      // The users row (login hash, country, sign-in date) feeds the public
+      // The users row (login hash, first sign-in date) feeds the public
       // stats; "Wipe all data" must take the student out of them too.
       await env.better_intra_d1
         .prepare("DELETE FROM users WHERE hash = ?")
