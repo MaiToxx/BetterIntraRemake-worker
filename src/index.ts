@@ -12,6 +12,7 @@ import {
   handleCalendarIcs,
 } from "./handlers/calendar";
 import { handleClusterSvg, handleClusterSvgs } from "./handlers/clusters";
+import { handleImageServe, handleImageUpload } from "./handlers/images";
 import { handleAnnouncement } from "./handlers/announcement";
 import { handleStats } from "./handlers/stats";
 import { Env, UserData } from "./types";
@@ -49,6 +50,7 @@ const USER_ROUTES = new Set([
   "/api/v1/private/subjects/state",
   "/api/v1/private/calendar/token",
   "/api/v1/private/calendar/update",
+  "/api/v1/private/images",
 ]);
 
 async function route(request: Request, env: Env): Promise<Response> {
@@ -91,6 +93,12 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (url.pathname === "/api/v1/cluster/svgs") {
     return handleClusterSvgs(env, origin);
+  }
+
+  const imgMatch = url.pathname.match(/^\/img\/([a-f0-9]{64})\/([a-z]+)$/);
+  if (imgMatch) {
+    if (request.method !== "GET") return textRes("Method not allowed", 405);
+    return handleImageServe(env, imgMatch[1], imgMatch[2]);
   }
 
   const calMatch = url.pathname.match(/^\/calendar\/([^\/]+)\.ics$/);
@@ -149,6 +157,10 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   if (url.pathname === "/api/v1/private/subjects/state") {
     return handleSubjectsState(request, env, loginParam, existingData);
+  }
+
+  if (url.pathname === "/api/v1/private/images") {
+    return handleImageUpload(request, env, loginParam, existingData);
   }
 
   if (url.pathname === "/api/v1/private/calendar/token") {

@@ -1,5 +1,6 @@
 import { Env, UserData } from "../types";
 import { deleteCalendarData } from "./calendar";
+import { deleteUserImages } from "./images";
 import { rateLimited, tooManyRes } from "../rate-limit";
 import {
   getBearerToken,
@@ -385,6 +386,9 @@ export async function handlePrivateSettings(
         .prepare("DELETE FROM users WHERE hash = ?")
         .bind(loginParam)
         .run();
+      // Uploaded images: after the D1 steps, which are the ones that can
+      // fail, so a retry finds nothing half-deleted.
+      await deleteUserImages(env, loginParam);
       await env.BETTER_INTRA_KV.delete(loginParam);
       return textRes("All cloud data deleted");
     }

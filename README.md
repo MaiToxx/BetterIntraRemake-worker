@@ -15,6 +15,7 @@ This deployment serves the **Intra-login build** of the extension: no 42 OAuth a
 | `DELETE /api/v1/private/settings?login=<hash>[&all=true]` | Bearer session | Removes the calling session; `all=true` is "Wipe all data" (see below). |
 | `GET /api/v1/public/visuals?login=<hash>` | none | Public visuals of one profile, `Cache-Control: public, max-age=300`. |
 | `GET /api/v1/public/visuals?logins=<h1>,<h2>,...` | none | Same, for up to 50 hashes in one call: `{"visuals": {<hash>: {...}}}`. Unknown hashes get the defaults, like the single form. |
+| `POST /api/v1/private/images?slot=avatar\|banner\|background` (raw image body, 2 MB, PNG/JPEG/GIF/WebP by magic bytes), `GET /img/<hash>/<slot>?v=` | Bearer session / none | Profile images uploaded from the editor, one KV value per slot (a new upload replaces the old), served with a year of cache. Wipe deletes them. |
 | `POST /api/v1/private/calendar/token`, `POST /api/v1/private/calendar/update`, `GET /calendar/<token>.ics` | Bearer session / opaque token | Calendar links. |
 | `POST /api/v1/private/subjects/report`, `GET /api/v1/private/subjects/state` | Bearer session | Subject tracker. |
 | `GET /api/v1/cluster/svg?url=`, `GET /api/v1/cluster/svgs` | none | Cluster maps (SVGs from `https://*.intra.42.fr` only). |

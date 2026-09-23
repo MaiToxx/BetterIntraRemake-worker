@@ -99,7 +99,8 @@ export class FakeD1 {
 }
 
 export class FakeKV {
-  readonly data = new Map<string, string>();
+  readonly data = new Map<string, string | ArrayBuffer>();
+  readonly meta = new Map<string, unknown>();
   readonly puts: string[] = [];
   readonly deletes: string[] = [];
   /** When set, put() throws this (the daily limit, an outage). */
@@ -119,6 +120,8 @@ export class FakeKV {
     const one = (k: string) => {
       const raw = this.data.get(k);
       if (raw === undefined) return null;
+      if (type === "arrayBuffer") return typeof raw === "string" ? new TextEncoder().encode(raw).buffer : raw;
+      if (typeof raw !== "string") return null;
       return type === "json" ? JSON.parse(raw) : raw;
     };
     // Bulk form, like KV: a Map with null for the keys that do not exist
@@ -126,20 +129,34 @@ export class FakeKV {
     return one(key);
   }
 
-  async put(key: string, value: string): Promise<void> {
+  async put(
+    key: string,
+    value: string | ArrayBuffer | ArrayBufferView,
+    opts?: { metadata?: unknown },
+  ): Promise<void> {
     if (this.putError) throw this.putError;
     this.puts.push(key);
-    this.data.set(key, value);
+    const stored = ArrayBuffer.isView(value)
+      ? value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength)
+      : value;
+    this.data.set(key, stored as string | ArrayBuffer);
+    if (opts?.metadata !== undefined) this.meta.set(key, opts.metadata);
+    else this.meta.delete(key);
+  }
+
+  async getWithMetadata(key: string, opts?: { type?: string } | string) {
+    return { value: await this.get(key, opts), metadata: this.meta.get(key) ?? null };
   }
 
   async delete(key: string): Promise<void> {
     this.deletes.push(key);
     this.data.delete(key);
+    this.meta.delete(key);
   }
 
   json(key: string): any {
     const raw = this.data.get(key);
-    return raw === undefined ? undefined : JSON.parse(raw);
+    return typeof raw !== "string" ? undefined : JSON.parse(raw);
   }
 }
 
