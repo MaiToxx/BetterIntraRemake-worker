@@ -1,9 +1,17 @@
 import { Env } from "../types";
-import { jsonRes, textRes } from "../utils";
+import { jsonRes, readJsonBody, textRes } from "../utils";
 
 const ANNOUNCEMENT_KEY = "ANNOUNCEMENT";
 const MAX_MESSAGE_LENGTH = 500;
 const MAX_LINKS = 5;
+
+/**
+ * Largest POST body read. The route is open to anyone until the secret is
+ * checked, and that check needs the parsed body: a 500-character message
+ * and five links fit many times over.
+ */
+export const MAX_ANNOUNCEMENT_BODY_BYTES = 16 * 1024;
+
 const VALID_LEVELS = ["info", "warning", "critical"] as const;
 export type AnnouncementLevel = (typeof VALID_LEVELS)[number];
 
@@ -60,12 +68,13 @@ export async function handleAnnouncement(
   }
 
   if (request.method === "POST") {
-    let body: any;
-    try {
-      body = await request.json();
-    } catch {
-      return textRes("Invalid JSON", 400);
-    }
+    const parsed = await readJsonBody<any>(
+      request,
+      MAX_ANNOUNCEMENT_BODY_BYTES,
+      "Body too large",
+    );
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.value;
     // The secret only ever travels in a JSON body: a query string would sit
     // in Workers Logs for the retention window. Unset secret = route closed.
     if (

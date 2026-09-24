@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
   handlePublicVisuals,
+  handlePublicVisualsBatch,
   publicExtras,
   publicLook,
   PUBLIC_EXTRAS_KEYS,
 } from "../src/handlers/settings";
+import { FakeKV, makeEnv } from "./helpers/fake-env";
 
 const req = (method = "GET") =>
   new Request("https://worker.test/api/v1/public/visuals?login=abc", { method });
@@ -277,6 +279,35 @@ describe("handlePublicVisuals", () => {
     expect(body.logtime.labelsColor).toBe("#abcdef");
     expect(body.logtime.emojiRate).toBeUndefined();
     expect(body.logtime.emojiDivisor).toBe(4);
+  });
+
+  it("never serves the hourly rate, single or batch, and keeps the display values", async () => {
+    // LOGTIME_EMOJI_RATE was labelled "Hourly Earning": possibly real pay
+    const settings = {
+      LOGTIME_EMOJI_RATE: 13.5,
+      LOGTIME_EMOJI: "🌮",
+      LOGTIME_EMOJI_DIVISOR: 8.7,
+      LOGTIME_CALENDAR_COLOR: "#123456",
+    };
+    const single = (await (await handlePublicVisuals(req(), { settings })).json()) as Record<string, any>;
+    expect(single.logtime).not.toHaveProperty("emojiRate");
+    expect(single.logtime).toEqual({
+      calendarColor: "#123456",
+      emoji: "🌮",
+      emojiDivisor: 8.7,
+    });
+
+    const login = "f".repeat(64);
+    const { env } = makeEnv({ kv: new FakeKV({ [login]: { sessionTokens: ["s"], settings } }) });
+    const batch = await handlePublicVisualsBatch(
+      new Request(`https://worker.test/api/v1/public/visuals?logins=${login}`),
+      env,
+      login,
+    );
+    const text = await batch.text();
+    expect(text).not.toContain("emojiRate");
+    expect(text).not.toContain("13.5");
+    expect(JSON.parse(text).visuals[login].logtime.emojiDivisor).toBe(8.7);
   });
 
   it("lets the browser cache the answer for five minutes", async () => {

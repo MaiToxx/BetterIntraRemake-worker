@@ -227,13 +227,14 @@ export function publicVisuals(existingData: UserData | null) {
       profileColor: optStr(settings.LOGTIME_CALENDAR_COLOR, MAX_VISUAL_WORD),
     },
 
-    // Public Logtime settings
+    // Public Logtime settings: display values only. LOGTIME_EMOJI_RATE is
+    // not one of them: the hub long labelled it "Hourly Earning", so it can
+    // hold a student's real pay, and visitors count with their own rate.
     logtime: {
       calendarColor: optStr(settings.LOGTIME_CALENDAR_COLOR, MAX_VISUAL_WORD),
       labelsColor: optStr(settings.LOGTIME_LABELS_COLOR, MAX_VISUAL_WORD),
       emoji: optStr(settings.LOGTIME_EMOJI, MAX_VISUAL_WORD),
       emojiDivisor: optNum(settings.LOGTIME_EMOJI_DIVISOR),
-      emojiRate: optNum(settings.LOGTIME_EMOJI_RATE),
       rainbowPalette: optStr(settings.LOGTIME_RAINBOW_PALETTE, MAX_VISUAL_URL),
     },
   };

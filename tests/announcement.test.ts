@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { handleAnnouncement } from "../src/handlers/announcement";
+import {
+  handleAnnouncement,
+  MAX_ANNOUNCEMENT_BODY_BYTES,
+} from "../src/handlers/announcement";
 import { FakeKV, makeEnv } from "./helpers/fake-env";
 
 const SECRET = "announce-secret-123";
@@ -93,5 +96,42 @@ describe("announcement", () => {
     expect(res.status).toBe(405);
     expect(kv.deletes).toEqual([]);
     expect(kv.json("ANNOUNCEMENT").message).toBe("Maintenance tonight");
+  });
+});
+
+describe("announcement POST body cap", () => {
+  it("refuses a body past the cap with 413, before the secret check and any write", async () => {
+    const { env, kv } = setup();
+    const huge = "x".repeat(MAX_ANNOUNCEMENT_BODY_BYTES);
+    for (const secret of [SECRET, "wrong"]) {
+      const res = await handleAnnouncement(post({ secret, message: "", padding: huge }), env);
+      expect(res.status).toBe(413);
+    }
+    expect(kv.puts).toEqual([]);
+    expect(kv.deletes).toEqual([]);
+    expect(kv.json("ANNOUNCEMENT").message).toBe("Maintenance tonight");
+  });
+
+  it("still takes the largest real announcement", async () => {
+    const { env, kv } = setup(false);
+    const links = Array.from({ length: 5 }, (_, i) => ({
+      text: `Link ${i} `.padEnd(100, "t"),
+      url: `https://docs.test/${"p".repeat(1000)}${i}`,
+    }));
+    const message = "é".repeat(500);
+    const res = await handleAnnouncement(
+      post({ secret: SECRET, message, level: "info", links }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    expect(kv.json("ANNOUNCEMENT")).toMatchObject({ message, links });
+  });
+
+  it("answers 400 for a body that is not JSON and 403 for one that is not an object", async () => {
+    const { env, kv } = setup();
+    const raw = (body: string) => new Request(URL, { method: "POST", body });
+    expect((await handleAnnouncement(raw("{"), env)).status).toBe(400);
+    expect((await handleAnnouncement(raw("null"), env)).status).toBe(403);
+    expect(kv.puts).toEqual([]);
   });
 });

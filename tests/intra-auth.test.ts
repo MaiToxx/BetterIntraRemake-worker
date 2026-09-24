@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vite
 import {
   INTRA_ISSUER,
   JWKS_REFRESH_MIN_INTERVAL_MS,
+  MAX_AUTH_BODY_BYTES,
   handleIntraAuth,
   resetJwksRefreshThrottle,
   verifyIntraJwt,
@@ -10,7 +11,7 @@ import {
 import type { Env } from "../src/types";
 import { LIMITS, resetRateLimits } from "../src/rate-limit";
 import { hashLogin } from "../src/utils";
-import { FakeD1 } from "./helpers/fake-env";
+import { FakeD1, FakeRateLimit } from "./helpers/fake-env";
 
 // Node 20+ exposes WebCrypto globally, like the Workers runtime does.
 const subtle = crypto.subtle;
@@ -411,5 +412,92 @@ describe("handleIntraAuth users row", () => {
     expect((await handleIntraAuth(fromFrance(await sign(validPayload(), privateKey)), env)).status).toBe(200);
     expect(d1.rows("SELECT hash, country, created_at FROM users")).toEqual(first);
     for (const sql of d1.prepared) expect(sql).not.toMatch(/country/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleIntraAuth: body cap (the route is unauthenticated)
+// ---------------------------------------------------------------------------
+
+describe("handleIntraAuth body cap", () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    resetJwksRefreshThrottle();
+    resetRateLimits();
+    fetchMock = vi.fn(async () => new Response(JSON.stringify({ keys: jwks }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  /** Env whose limiters record every call. */
+  function limitedEnv() {
+    const made = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    const anon = new FakeRateLimit();
+    const write = new FakeRateLimit();
+    Object.assign(made.env, { ANON_RL: anon, WRITE_RL: write });
+    return { ...made, anon, write };
+  }
+
+  it("refuses a body past the cap with 413 before any KV, JWKS or limiter work", async () => {
+    const { env, puts, anon, write } = limitedEnv();
+    const getSpy = vi.spyOn(env.BETTER_INTRA_KV, "get");
+    // A genuine token padded with spaces (decodeJwt trims them): only the
+    // size can refuse it.
+    const token = await sign(validPayload(), privateKey);
+    const req = new Request("https://worker.test/auth/intra", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "CF-Connecting-IP": "203.0.113.9" },
+      body: JSON.stringify({ token: token + " ".repeat(MAX_AUTH_BODY_BYTES) }),
+    });
+    const res = await handleIntraAuth(req, env);
+    expect(res.status).toBe(413);
+    expect(await res.text()).toMatch(/too large/i);
+    expect(getSpy).not.toHaveBeenCalled();
+    expect(puts).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(anon.calls).toEqual([]);
+    expect(write.calls).toEqual([]);
+  });
+
+  it("stops reading a streamed body as soon as it is over the cap", async () => {
+    const { env } = limitedEnv();
+    let pulled = 0;
+    const chunk = new Uint8Array(16 * 1024).fill(0x20);
+    // 16 MB if read to the end
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled++ >= 1024) controller.close();
+        else controller.enqueue(chunk);
+      },
+    });
+    const req = new Request("https://worker.test/auth/intra", {
+      method: "POST",
+      body,
+      duplex: "half",
+    } as RequestInit);
+    expect((await handleIntraAuth(req, env)).status).toBe(413);
+    expect(pulled).toBeLessThan(8);
+  });
+
+  it("still signs in with a large token under the cap", async () => {
+    const { env } = limitedEnv();
+    const token = await sign(validPayload(), privateKey);
+    const res = await handleIntraAuth(authRequest(token + " ".repeat(MAX_AUTH_BODY_BYTES - 2048)), env);
+    expect(res.status).toBe(200);
+  });
+
+  it("answers 400 (not 500) for a JSON body that is not an object", async () => {
+    const { env } = limitedEnv();
+    for (const raw of ["null", "42", '"eyJ.x.y"', "{"]) {
+      const req = new Request("https://worker.test/auth/intra", { method: "POST", body: raw });
+      expect((await handleIntraAuth(req, env)).status).toBe(400);
+    }
   });
 });

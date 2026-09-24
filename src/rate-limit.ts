@@ -5,12 +5,13 @@ import { textRes } from "./utils";
  * Three buckets, all over one minute:
  *
  *  - "write", keyed by login hash: every route that writes the user's data
- *    (sign-in once the token is verified, settings push, session removal,
- *    calendar link and calendar upload). The KV namespace shares 1,000 writes
- *    a day on the free plan and past the limit every put throws for everyone
- *    until midnight UTC, so one client replaying its own valid token, or
- *    pushing distinct payloads in a loop, must stay slow. 10 a minute is far
- *    above any real use (sign-in is a click, a push is a hub action).
+ *    (sign-in once the token is verified, settings push, wipe, calendar
+ *    link, stop and upload, images, subject reports). The KV namespace
+ *    shares 1,000 writes a day on the free plan and past the limit every put
+ *    throws for everyone until midnight UTC, so one client replaying its
+ *    own valid token, or pushing distinct payloads in a loop, must stay
+ *    slow. 10 a minute is far above any real use (sign-in is a click, a
+ *    push is a hub action).
  *  - "anon", keyed by client IP: the unauthenticated /auth/intra before any
  *    JWKS work, so garbage POSTs cannot make the worker hammer auth.42.fr.
  *    A campus sits behind one NAT, hence the higher limit.

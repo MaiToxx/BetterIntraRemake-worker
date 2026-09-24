@@ -92,6 +92,15 @@ async function wipe(env: Env, login: string): Promise<Response> {
   return handlePrivateSettings(req, env, login, await userData(env, login));
 }
 
+/** "Stop sharing": DELETE /api/v1/private/calendar/token. */
+async function stop(env: Env, login: string, auth = SESSION[login]): Promise<Response> {
+  const req = new Request(
+    `https://w.test/api/v1/private/calendar/token?login=${login}`,
+    { method: "DELETE", headers: { Authorization: `Bearer ${auth}` } },
+  );
+  return handleCalendarToken(req, env, login, await userData(env, login));
+}
+
 async function feed(
   env: Env,
   token: string,
@@ -357,5 +366,167 @@ describe("private calendar routes", () => {
     expect(d1.prepared.length).toBe(statements);
     // bob has his own budget
     expect((await upload(env, BOB, ICS_BOB)).status).toBe(200);
+  });
+});
+
+describe("Stop sharing (DELETE calendar/token)", () => {
+  const icsRows = (d1: FakeD1, login: string) =>
+    d1.rows("SELECT ics_body FROM calendar_ics WHERE login_hash = ?", login);
+
+  it("revokes the link and deletes the stored calendar, and nothing else", async () => {
+    const { env, kv, d1 } = setup();
+    await register(env, ALICE, T1);
+    await upload(env, ALICE, ICS_ALICE);
+    await register(env, BOB, T2);
+    await upload(env, BOB, ICS_BOB);
+
+    const res = await stop(env, ALICE);
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect((await feed(env, T1)).status).toBe(404);
+    expect(icsRows(d1, ALICE)).toEqual([]);
+    // not "Wipe all data": the settings backup and the session stay
+    expect(await userData(env, ALICE)).toEqual(user(ALICE));
+    expect(kv.puts).toEqual([]);
+    expect(kv.deletes).toEqual([]);
+    // other users are untouched
+    expect(await feed(env, T2)).toEqual({ status: 200, body: ICS_BOB });
+  });
+
+  it("retires the legacy link named in the synced settings", async () => {
+    const { env, kv } = setup({
+      [`CALENDAR_TOKEN_${LEGACY}`]: ALICE,
+      [ALICE]: user(ALICE, { CALENDAR_SYNC_TOKEN: LEGACY }),
+    });
+    expect((await upload(env, ALICE, ICS_ALICE)).status).toBe(200);
+    expect(await feed(env, LEGACY)).toEqual({ status: 200, body: ICS_ALICE });
+
+    expect((await stop(env, ALICE)).status).toBe(204);
+    expect((await feed(env, LEGACY)).status).toBe(404);
+    expect(kv.data.has(`CALENDAR_TOKEN_${LEGACY}`)).toBe(false);
+  });
+
+  it("refuses later uploads with 410 until a new link is made", async () => {
+    const { env, d1 } = setup();
+    await register(env, ALICE, T1);
+    await upload(env, ALICE, ICS_ALICE);
+    await stop(env, ALICE);
+
+    // a second browser that restored CALENDAR_SYNC_TOKEN from the cloud
+    const res = await upload(env, ALICE, ICS_ALICE);
+    expect(res.status).toBe(410);
+    expect(await res.json()).toEqual({ error: "calendar_stopped" });
+    expect(icsRows(d1, ALICE)).toEqual([]);
+
+    // "Generate calendar link" again: sharing resumes on the new link only
+    expect((await register(env, ALICE, T2)).status).toBe(200);
+    expect((await upload(env, ALICE, ICS_ALICE)).status).toBe(200);
+    expect(await feed(env, T2)).toEqual({ status: 200, body: ICS_ALICE });
+    expect((await feed(env, T1)).status).toBe(404);
+  });
+
+  it("is not undone by an upload already past its checks when the stop lands", async () => {
+    const { env, d1 } = setup();
+    await register(env, ALICE, T1);
+    await upload(env, ALICE, ICS_ALICE);
+    // The stop commits right before the upload's write: a check made earlier
+    // in that request would still have seen the live link.
+    const prepare = d1.prepare.bind(d1);
+    let stopped = false;
+    d1.prepare = (sql: string) => {
+      if (!stopped && /INTO calendar_ics/.test(sql)) {
+        stopped = true;
+        d1.raw
+          .prepare("UPDATE calendar_tokens SET revoked_at = unixepoch() WHERE login_hash = ?")
+          .run(ALICE);
+        d1.raw.prepare("DELETE FROM calendar_ics WHERE login_hash = ?").run(ALICE);
+      }
+      return prepare(sql);
+    };
+    const res = await upload(env, ALICE, ICS_ALICE);
+    expect(stopped).toBe(true);
+    expect(res.status).toBe(410);
+    expect(icsRows(d1, ALICE)).toEqual([]);
+  });
+
+  it("also refuses uploads after a wipe, and never a login without a D1 link", async () => {
+    const { env, kv, d1 } = setup({ [`CALENDAR_TOKEN_${LEGACY}`]: BOB });
+    await register(env, ALICE, T1);
+    await wipe(env, ALICE);
+    kv.data.set(ALICE, JSON.stringify(user(ALICE)));
+    expect((await upload(env, ALICE, ICS_ALICE)).status).toBe(410);
+    expect(icsRows(d1, ALICE)).toEqual([]);
+
+    // bob only has a legacy link (no row): his uploads keep feeding it
+    expect((await upload(env, BOB, ICS_BOB)).status).toBe(200);
+    expect(await feed(env, LEGACY)).toEqual({ status: 200, body: ICS_BOB });
+  });
+
+  it("answers the same 401 as every private route, and changes nothing", async () => {
+    const { env, d1 } = setup();
+    await register(env, ALICE, T1);
+    await upload(env, ALICE, ICS_ALICE);
+    const snapshot = async (res: Response) => ({
+      status: res.status,
+      body: await res.text(),
+      headers: [...res.headers.entries()].sort(),
+    });
+    const noHeader = await snapshot(
+      await handleCalendarToken(
+        new Request(`https://w.test/api/v1/private/calendar/token?login=${ALICE}`, {
+          method: "DELETE",
+        }),
+        env,
+        ALICE,
+        await userData(env, ALICE),
+      ),
+    );
+    expect(noHeader.status).toBe(401);
+    expect(await snapshot(await stop(env, ALICE, "forged"))).toEqual(noHeader);
+    const carol = "c".repeat(64);
+    expect(
+      await snapshot(
+        await handleCalendarToken(
+          new Request(`https://w.test/api/v1/private/calendar/token?login=${carol}`, {
+            method: "DELETE",
+            headers: { Authorization: "Bearer x" },
+          }),
+          env,
+          carol,
+          null,
+        ),
+      ),
+    ).toEqual(noHeader);
+    expect(await feed(env, T1)).toEqual({ status: 200, body: ICS_ALICE });
+    expect(icsRows(d1, ALICE)).toEqual([{ ics_body: ICS_ALICE }]);
+  });
+
+  it("is limited in the write bucket, before any D1 statement", async () => {
+    const { env, d1 } = setup();
+    for (let i = 0; i < LIMITS.write.limit; i++) {
+      expect((await stop(env, ALICE)).status).toBe(204);
+    }
+    // one marker row for a login that had none, not one per click
+    expect(
+      d1.rows("SELECT COUNT(*) AS n FROM calendar_tokens WHERE login_hash = ?", ALICE),
+    ).toEqual([{ n: 1 }]);
+    const statements = d1.prepared.length;
+    const res = await stop(env, ALICE);
+    expect(res.status).toBe(429);
+    expect(d1.prepared.length).toBe(statements);
+  });
+
+  it("refuses the other methods", async () => {
+    const { env } = setup();
+    for (const method of ["GET", "PUT", "PATCH"]) {
+      const req = new Request(
+        `https://w.test/api/v1/private/calendar/token?login=${ALICE}`,
+        { method, headers: { Authorization: `Bearer ${SESSION[ALICE]}` } },
+      );
+      expect(
+        (await handleCalendarToken(req, env, ALICE, await userData(env, ALICE))).status,
+      ).toBe(405);
+    }
   });
 });

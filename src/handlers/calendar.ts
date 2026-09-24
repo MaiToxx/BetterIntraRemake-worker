@@ -1,6 +1,12 @@
 import { Env, UserData } from "../types";
 import { rateLimited, tooManyRes } from "../rate-limit";
-import { jsonRes, readJsonBody, requireSession, textRes } from "../utils";
+import {
+  corsHeaders,
+  jsonRes,
+  readJsonBody,
+  requireSession,
+  textRes,
+} from "../utils";
 
 /**
  * A full year of Intra events is a few tens of KB of ICS. D1 refuses rows past
@@ -113,17 +119,33 @@ async function deleteLegacyKey(env: Env, kvKey: string | null): Promise<void> {
   }
 }
 
+/**
+ * /api/v1/private/calendar/token?login=<hash>
+ *  - POST {token}: registers a new link, which revokes the previous one.
+ *  - DELETE: "Stop sharing". Revokes the link and deletes the stored
+ *    calendar (204), without the rest of "Wipe all data": until then the
+ *    only way to take a timetable off the server was to wipe the settings
+ *    backup, images and sessions with it.
+ */
 export async function handleCalendarToken(
   request: Request,
   env: Env,
   loginParam: string,
   existingData: UserData | null,
 ): Promise<Response> {
-  if (request.method !== "POST") return textRes("Method not allowed", 405);
+  if (request.method !== "POST" && request.method !== "DELETE") {
+    return textRes("Method not allowed", 405);
+  }
 
   const denied = requireSession(request, existingData);
   if (denied) return denied;
   const record = existingData as UserData;
+
+  if (request.method === "DELETE") {
+    if (await rateLimited(env, "write", loginParam)) return tooManyRes();
+    await deleteCalendarData(env, loginParam, record.settings);
+    return new Response(null, { status: 204, headers: corsHeaders });
+  }
 
   const body = await readJsonBody<{ token?: unknown }>(
     request,
@@ -186,10 +208,13 @@ export async function handleCalendarToken(
 }
 
 /**
- * "Wipe all data": revokes every calendar link of the login and deletes the
- * stored calendar. The marker row matters for a login that only ever had
- * legacy links: without a row here, those would keep answering once the user
- * signs in again.
+ * "Wipe all data" and "Stop sharing": revokes every calendar link of the
+ * login and deletes the stored calendar. The marker row matters for a login
+ * that only ever had legacy links: without a row here, those would keep
+ * answering once the user signs in again. It also makes the login read as
+ * stopped for handleCalendarUpdate until a new link is registered. A login
+ * that already has rows gets no marker: they are all revoked by then, and
+ * "Stop sharing" clicked again must not add a row each time.
  */
 export async function deleteCalendarData(
   env: Env,
@@ -208,9 +233,9 @@ export async function deleteCalendarData(
     ...legacy.stmts,
     db
       .prepare(
-        "INSERT INTO calendar_tokens (token, login_hash, revoked_at) VALUES (?, ?, unixepoch())",
+        "INSERT INTO calendar_tokens (token, login_hash, revoked_at) SELECT ?, ?, unixepoch() WHERE NOT EXISTS (SELECT 1 FROM calendar_tokens WHERE login_hash = ?)",
       )
-      .bind(`wiped:${crypto.randomUUID()}`, loginParam),
+      .bind(`wiped:${crypto.randomUUID()}`, loginParam, loginParam),
     db
       .prepare("DELETE FROM calendar_ics WHERE login_hash = ?")
       .bind(loginParam),
@@ -243,12 +268,23 @@ export async function handleCalendarUpdate(
 
   if (await rateLimited(env, "write", loginParam)) return tooManyRes();
 
-  await env.better_intra_d1
+  // CALENDAR_SYNC_TOKEN is a synced setting: another browser that restored it
+  // keeps uploading on every profile visit after "Stop sharing". Nobody could
+  // read that copy (no live link), but the timetable the student took off the
+  // server would be back on it. So the row is only written while the login
+  // has a live link, or no link row at all (legacy KV links only, or none
+  // yet). One statement rather than a check then a write: a stop landing in
+  // between would be undone by the write.
+  await ensureTokensTable(env);
+  const { meta } = await env.better_intra_d1
     .prepare(
-      "INSERT OR REPLACE INTO calendar_ics (login_hash, ics_body, updated_at) VALUES (?, ?, unixepoch())",
+      "INSERT OR REPLACE INTO calendar_ics (login_hash, ics_body, updated_at) SELECT ?, ?, unixepoch() WHERE NOT EXISTS (SELECT 1 FROM calendar_tokens WHERE login_hash = ?) OR EXISTS (SELECT 1 FROM calendar_tokens WHERE login_hash = ? AND revoked_at IS NULL)",
     )
-    .bind(loginParam, ics)
+    .bind(loginParam, ics, loginParam, loginParam)
     .run();
+  // Strictly 0: the 410 makes the extension forget its link, so a result
+  // that says nothing must not read as "stopped".
+  if (meta.changes === 0) return jsonRes({ error: "calendar_stopped" }, 410);
 
   return jsonRes({ ok: true });
 }

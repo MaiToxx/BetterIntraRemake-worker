@@ -14,7 +14,7 @@
  */
 import { Env, UserData } from "../types";
 import { rateLimited, tooManyRes } from "../rate-limit";
-import { getTokens, hashLogin, jsonRes, textRes } from "../utils";
+import { getTokens, hashLogin, jsonRes, readJsonBody, textRes } from "../utils";
 
 export const INTRA_ISSUER = "https://auth.42.fr/auth/realms/students-42";
 const JWKS_URL = `${INTRA_ISSUER}/protocol/openid-connect/certs`;
@@ -28,6 +28,12 @@ const JWKS_TTL_S = 6 * 60 * 60;
  * set only reaches KV once a token verified with it (see handleIntraAuth).
  */
 export const JWKS_REFRESH_MIN_INTERVAL_MS = 5 * 60 * 1000;
+/**
+ * Largest sign-in body read. The route is unauthenticated, so the body must
+ * never be buffered whole: a Keycloak access token is 1 to 3 KB, and 32 KB
+ * leaves room for one carrying many roles or groups.
+ */
+export const MAX_AUTH_BODY_BYTES = 32 * 1024;
 
 export interface Jwk {
   kid?: string;
@@ -246,20 +252,23 @@ export async function handleIntraAuth(
 ): Promise<Response> {
   if (request.method !== "POST") return textRes("Method not allowed", 405);
 
-  let body: { token?: unknown };
-  try {
-    body = (await request.json()) as { token?: unknown };
-  } catch {
-    return textRes("Invalid JSON body", 400);
-  }
-  if (typeof body.token !== "string" || body.token.length < 20) {
+  // Capped before anything else: request.json() buffered and parsed a body
+  // of any size ahead of the per-IP limiter below.
+  const body = await readJsonBody<{ token?: unknown } | null>(
+    request,
+    MAX_AUTH_BODY_BYTES,
+    "Body too large",
+  );
+  if (!body.ok) return body.response;
+  const token = body.value?.token;
+  if (typeof token !== "string" || token.length < 20) {
     return textRes("Missing token", 400);
   }
 
   const now = Date.now();
   // Reject garbage, expired and foreign tokens before touching KV or the JWKS
   // endpoint: this route is unauthenticated.
-  const decoded = decodeJwt(body.token);
+  const decoded = decodeJwt(token);
   if (!decoded || !checkClaims(decoded, now)) {
     return textRes("Invalid or expired Intra token", 401);
   }
@@ -276,7 +285,7 @@ export async function handleIntraAuth(
     console.warn(`[intra-auth] JWKS fetch failed: ${e}`);
     return textRes("Intra key server unreachable, retry in a minute", 503);
   }
-  const verified = await verifyIntraJwt(body.token, sets.keys, now);
+  const verified = await verifyIntraJwt(token, sets.keys, now);
   // Nothing is written before this point: a forged or invalid token never
   // costs a KV write.
   if (!verified) return textRes("Invalid or expired Intra token", 401);

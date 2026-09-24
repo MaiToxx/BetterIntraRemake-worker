@@ -137,6 +137,54 @@ describe("CORS preflight", () => {
   });
 });
 
+describe("calendar link stop through the router", () => {
+  beforeEach(() => {
+    resetRateLimits();
+  });
+
+  it("preflights and routes DELETE calendar/token to a 204 with CORS", async () => {
+    const { env } = seeded();
+    const url = `https://w.test/api/v1/private/calendar/token?login=${LOGIN}`;
+    const origin = "moz-extension://0e9f5b2c-0000-4000-8000-000000000000";
+    const pre = await worker.fetch(
+      new Request(url, {
+        method: "OPTIONS",
+        headers: { Origin: origin, "Access-Control-Request-Method": "DELETE" },
+      }),
+      env,
+    );
+    expect(pre.headers.get("Access-Control-Allow-Methods")).toContain("DELETE");
+
+    const res = await worker.fetch(
+      new Request(url, {
+        method: "DELETE",
+        headers: { Origin: origin, Authorization: `Bearer ${SESSION}` },
+      }),
+      env,
+    );
+    expect(res.status).toBe(204);
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  });
+});
+
+describe("unauthenticated bodies", () => {
+  it("are capped even without an Origin header, with a readable 413", async () => {
+    const { env, kv } = seeded();
+    const getSpy = vi.spyOn(kv, "get");
+    const huge = JSON.stringify({ token: "x".repeat(1024 * 1024) });
+    for (const path of ["/auth/intra", "/api/v1/public/announcement"]) {
+      const res = await worker.fetch(
+        new Request(`https://w.test${path}`, { method: "POST", body: huge }),
+        env,
+      );
+      expect(res.status).toBe(413);
+      expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    }
+    expect(getSpy).not.toHaveBeenCalled();
+    expect(kv.puts).toEqual([]);
+  });
+});
+
 describe("login parameter", () => {
   it("only accepts a login hash, so internal KV keys stay out of reach", async () => {
     const { env, kv } = seeded();
