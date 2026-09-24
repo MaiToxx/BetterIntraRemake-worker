@@ -314,7 +314,10 @@ export async function handleCalendarIcs(
       headers: {
         "Content-Type": "text/calendar; charset=utf-8",
         "Content-Disposition": 'inline; filename="betterintra-calendar.ics"',
-        "Cache-Control": "public, max-age=3600",
+        // private: one student's timetable behind a secret link, not
+        // something a shared cache should keep
+        "Cache-Control": "private, max-age=3600",
+        "X-Content-Type-Options": "nosniff",
       },
     });
   }
@@ -323,7 +326,10 @@ export async function handleCalendarIcs(
     headers: {
       "Content-Type": "text/calendar; charset=utf-8",
       "Content-Disposition": 'inline; filename="betterintra-calendar.ics"',
-      "Cache-Control": "public, max-age=3600",
+      // private: one student's timetable behind a secret link, not
+      // something a shared cache should keep
+      "Cache-Control": "private, max-age=3600",
+      "X-Content-Type-Options": "nosniff",
     },
   });
 }

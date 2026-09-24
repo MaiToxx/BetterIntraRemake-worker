@@ -3,9 +3,11 @@ import {
   fetchAllowed,
   jsonRes,
   readBodyCapped,
+  readJsonBody,
   requireSession,
   textRes,
 } from "../utils";
+import { rateLimited, tooManyRes } from "../rate-limit";
 
 /**
  * Hosts a subject link can be on. tracker.ts reports the `href` of the first
@@ -19,8 +21,13 @@ const SUBJECT_HOSTS = new Set(["cdn.intra.42.fr", "projects.intra.42.fr"]);
 /** Project slugs are short lowercase words joined by - or _. */
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/i;
 
-/** The extension reports one subject per request: room to spare, no chains. */
-const MAX_REPORT_ITEMS = 5;
+/**
+ * The extension reports one subject per request, and each new link can mean
+ * a PDF download of up to 16 MB: one item, not five.
+ */
+const MAX_REPORT_ITEMS = 1;
+/** A report is a slug and a URL: a few hundred bytes. */
+const MAX_REPORT_BYTES = 4 * 1024;
 const MAX_STATE_SLUGS = 20;
 
 /**
@@ -173,12 +180,14 @@ export async function handleSubjectsReport(
   const denied = requireSession(request, existingData);
   if (denied) return denied;
 
-  let body: { items?: any[] };
-  try {
-    body = await request.json();
-  } catch {
-    return textRes("Invalid JSON", 400);
-  }
+  // The only route that wrote shared data without a limit: a signed-in loop
+  // could fill the registry, flash "Subject updated" to everyone and make the
+  // worker download PDFs without end. Same bucket as the other writes.
+  if (await rateLimited(env, "write", loginParam)) return tooManyRes();
+
+  const parsed = await readJsonBody<{ items?: any[] }>(request, MAX_REPORT_BYTES, "Report too large");
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.value;
   const items = Array.isArray(body?.items)
     ? body.items.slice(0, MAX_REPORT_ITEMS)
     : [];
@@ -236,8 +245,14 @@ export async function handleSubjectsReport(
       continue;
     }
 
-    if (current.url === url) {
-      // Same link → no refetch, return the already-saved metadata.
+    // Same link, or another file of the same subject (the language versions
+    // of one PDF share its id): no refetch, the saved metadata. The extension
+    // reports a change only when the id differs (tracker.ts); students on two
+    // languages used to flip the link, and every flip was a download and a
+    // "Subject updated" for everyone.
+    const sameSubject =
+      !!subjectId && !!current.subject_id && String(current.subject_id) === subjectId;
+    if (current.url === url || sameSubject) {
       results.push({
         slug,
         status: "known",

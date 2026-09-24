@@ -4,6 +4,7 @@ import {
   getTokens,
   getBearerToken,
   isOriginAllowed,
+  redactPath,
 } from "../src/utils";
 
 describe("hashLogin", () => {
@@ -104,5 +105,13 @@ describe("isOriginAllowed", () => {
     expect(isOriginAllowed("https://intra.42.fr.evil.com")).toBe(false);
     expect(isOriginAllowed("https://evilintra.42.fr")).toBe(false);
     expect(isOriginAllowed("https://intra.42.fr.evil")).toBe(false);
+  });
+});
+
+describe("redactPath", () => {
+  it("keeps the calendar link token, login hashes and ids out of the logs", () => {
+    expect(redactPath("/calendar/8f14e45f-ceea-467a-9575-6d0f5b1c2e3a.ics")).toBe("/calendar/:token.ics");
+    expect(redactPath("/img/" + "ab".repeat(32) + "/avatar")).toBe("/img/:hash/avatar");
+    expect(redactPath("/api/v1/private/settings")).toBe("/api/v1/private/settings");
   });
 });

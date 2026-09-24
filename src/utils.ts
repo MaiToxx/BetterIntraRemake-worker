@@ -53,8 +53,23 @@ const SECRET_ENV_KEYS = ["ANNOUNCEMENT_SECRET"] as const;
  * (never the stack), cut short, with every configured secret blanked out in
  * case an upstream error echoed one back. The log line names the method and
  * path so a failing route can be told apart in Workers Logs, but never the
- * query string: it carries login hashes and calendar tokens.
+ * query string (login hashes, calendar tokens), and never a secret part of
+ * the path either: see redactPath().
  */
+/**
+ * A path as it may appear in the logs: the calendar link's token (the secret
+ * link itself: whoever reads it reads the feed), and login hashes (the
+ * /img/<hash>/<slot> routes) are replaced by placeholders. Workers Logs keep
+ * lines for days, and a D1 outage used to write every subscriber's link
+ * there on each calendar refresh.
+ */
+export function redactPath(pathname: string): string {
+  return pathname
+    .replace(/^\/calendar\/[^/]+$/, "/calendar/:token.ics")
+    .replace(/\/[0-9a-f]{64}(?=\/|$)/gi, "/:hash")
+    .replace(/\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?=[/.]|$)/gi, "/:id");
+}
+
 export function serverErrorRes(
   e: unknown,
   env: Partial<Env>,
@@ -64,7 +79,7 @@ export function serverErrorRes(
   if (request) {
     let pathname = "?";
     try {
-      pathname = new URL(request.url).pathname;
+      pathname = redactPath(new URL(request.url).pathname);
     } catch {}
     where = `${request.method} ${pathname}`;
   }

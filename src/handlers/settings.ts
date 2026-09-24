@@ -430,9 +430,9 @@ export async function handlePrivateSettings(
   }
 
   if (request.method === "DELETE") {
-    if (await rateLimited(env, "write", loginParam)) return tooManyRes();
     const url = new URL(request.url);
     if (url.searchParams.get("all") === "true") {
+      if (await rateLimited(env, "write", loginParam)) return tooManyRes();
       // Calendar first, then the D1 rows, then the record: if a step fails
       // the user record, and so the session needed to retry, is still there.
       await deleteCalendarData(env, loginParam, record.settings);
@@ -448,6 +448,10 @@ export async function handlePrivateSettings(
       await env.BETTER_INTRA_KV.delete(loginParam);
       return textRes("All cloud data deleted");
     }
+    // Signing out is not rate limited: it shared the 10-a-minute write bucket,
+    // so after a burst of uploads the sign-out got a 429 while the extension
+    // dropped its copy of the token, which then stayed valid here. It cannot
+    // be looped: the token is gone after one call, and the next one is a 401.
     await env.BETTER_INTRA_KV.put(
       loginParam,
       JSON.stringify({

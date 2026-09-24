@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { resetRateLimits } from "../src/rate-limit";
 import {
   handleSubjectsReport,
   handleSubjectsState,
@@ -131,6 +132,8 @@ describe("handleSubjectsReport", () => {
   let env: Env;
 
   beforeEach(() => {
+    // the write limiter counts per login across cases otherwise
+    resetRateLimits();
     d1 = new MockD1();
     d1.projectNames.set("python-module-10", "Python Module 10");
     env = makeEnv(d1);
@@ -301,24 +304,22 @@ describe("handleSubjectsReport", () => {
 
   it("never fetches or records a URL off the Intra subject hosts", async () => {
     const calls = mockPdfFetch(["D:20990101000000Z"]);
-    const res = await handleSubjectsReport(
-      post("https://x/report", {
-        items: [
-          { slug: "minishell", url: "https://evil.example/pdf/pdf/900001/en.subject.pdf" },
-          { slug: "minishell", url: "http://cdn.intra.42.fr/pdf/pdf/900001/en.subject.pdf" },
-          { slug: "minishell", url: "https://cdn.intra.42.fr.evil.example/pdf/pdf/1/en.subject.pdf" },
-          { slug: "minishell", url: "https://cdn.intra.42.fr@evil.example/pdf/pdf/1/en.subject.pdf" },
-          { slug: "minishell", url: "not a url" },
-        ],
-      }),
-      env,
-      "hash-a",
-      sessionData(),
-    );
-    const body = (await res.json()) as { subjects: any[] };
-    expect(body.subjects).toHaveLength(5);
-    for (const entry of body.subjects) {
-      expect(entry).toEqual({ slug: "minishell", status: "unknown", reason: "invalid_url" });
+    const urls = [
+      "https://evil.example/pdf/pdf/900001/en.subject.pdf",
+      "http://cdn.intra.42.fr/pdf/pdf/900001/en.subject.pdf",
+      "https://cdn.intra.42.fr.evil.example/pdf/pdf/1/en.subject.pdf",
+      "https://cdn.intra.42.fr@evil.example/pdf/pdf/1/en.subject.pdf",
+      "not a url",
+    ];
+    for (const url of urls) {
+      const res = await handleSubjectsReport(
+        post("https://x/report", { items: [{ slug: "minishell", url }] }),
+        env,
+        "hash-a",
+        sessionData(),
+      );
+      const body = (await res.json()) as { subjects: any[] };
+      expect(body.subjects).toEqual([{ slug: "minishell", status: "unknown", reason: "invalid_url" }]);
     }
     expect(calls).toEqual([]);
     expect(d1.subjects.size).toBe(0);
@@ -326,27 +327,23 @@ describe("handleSubjectsReport", () => {
 
   it("rejects malformed slugs before any work", async () => {
     const calls = mockPdfFetch(["D:20260811161924+02'00'"]);
-    const res = await handleSubjectsReport(
-      post("https://x/report", {
-        items: [
-          { slug: "x".repeat(101), url: URL_A },
-          { slug: "../libft", url: URL_A },
-          { slug: "libft minishell", url: URL_A },
-          { slug: "-libft", url: URL_A },
-        ],
-      }),
-      env,
-      "hash-a",
-      sessionData(),
-    );
-    const body = (await res.json()) as { subjects: any[] };
-    expect(body.subjects.map((e) => e.reason)).toEqual([
+    const entries: any[] = [];
+    for (const slug of ["x".repeat(101), "../libft", "libft minishell", "-libft"]) {
+      const res = await handleSubjectsReport(
+        post("https://x/report", { items: [{ slug, url: URL_A }] }),
+        env,
+        "hash-a",
+        sessionData(),
+      );
+      entries.push(...((await res.json()) as { subjects: any[] }).subjects);
+    }
+    expect(entries.map((e) => e.reason)).toEqual([
       "invalid_slug",
       "invalid_slug",
       "invalid_slug",
       "invalid_slug",
     ]);
-    expect(body.subjects[0].slug).toHaveLength(100);
+    expect(entries[0].slug).toHaveLength(100);
     expect(calls).toEqual([]);
     expect(d1.subjects.size).toBe(0);
   });
@@ -354,14 +351,17 @@ describe("handleSubjectsReport", () => {
   it("accepts real project slugs", async () => {
     mockPdfFetch(["D:20260811161924+02'00'"]);
     const slugs = ["42cursus-libft", "ft_printf", "c-piscine-c-00", "python-module-10"];
-    const res = await handleSubjectsReport(
-      post("https://x/report", { items: slugs.map((slug) => ({ slug, url: URL_A })) }),
-      env,
-      "hash-a",
-      sessionData(),
-    );
-    const body = (await res.json()) as { subjects: any[] };
-    expect(body.subjects.map((e) => e.status)).toEqual(["first", "first", "first", "first"]);
+    const statuses: string[] = [];
+    for (const slug of slugs) {
+      const res = await handleSubjectsReport(
+        post("https://x/report", { items: [{ slug, url: URL_A }] }),
+        env,
+        "hash-a",
+        sessionData(),
+      );
+      statuses.push(((await res.json()) as { subjects: any[] }).subjects[0].status);
+    }
+    expect(statuses).toEqual(["first", "first", "first", "first"]);
   });
 
   it("stores the link without query or fragment, like the extension sends it", async () => {
@@ -376,7 +376,7 @@ describe("handleSubjectsReport", () => {
     expect(d1.subjects.get("libft")?.url).toBe(URL_A);
   });
 
-  it("handles at most 5 items per request", async () => {
+  it("handles one item per request (each can be a 16 MB download)", async () => {
     const calls = mockPdfFetch(["D:20260811161924+02'00'"]);
     const items = Array.from({ length: 12 }, (_, i) => ({ slug: `project-${i}`, url: URL_A }));
     const res = await handleSubjectsReport(
@@ -386,8 +386,48 @@ describe("handleSubjectsReport", () => {
       sessionData(),
     );
     const body = (await res.json()) as { subjects: any[] };
-    expect(body.subjects).toHaveLength(5);
-    expect(calls).toHaveLength(5);
+    expect(body.subjects).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("refuses a body over 4 KB, and a loop past the write limit", async () => {
+    const big = await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: URL_A, pad: "x".repeat(5000) }] }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    expect(big.status).toBe(413);
+    mockPdfFetch(["D:20260811161924+02'00'"]);
+    const statuses: number[] = [];
+    for (let i = 0; i < 12; i++) {
+      const res = await handleSubjectsReport(
+        post("https://x/report", { items: [{ slug: "libft", url: URL_A }] }),
+        env,
+        "hash-loop",
+        sessionData(),
+      );
+      statuses.push(res.status);
+    }
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThan(0);
+  });
+
+  it("another file of the same subject (a language version) is not a change", async () => {
+    const calls = mockPdfFetch(["D:20260811161924+02'00'"]);
+    await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: URL_A }] }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const res = await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: URL_A.replace("en.subject", "fr.subject") }] }),
+      env,
+      "hash-b",
+      sessionData(),
+    );
+    expect(((await res.json()) as { subjects: any[] }).subjects[0].status).toBe("known");
+    expect(calls).toHaveLength(1);
   });
 
   it("does not follow a redirect off the subject hosts", async () => {
@@ -423,17 +463,16 @@ describe("handleSubjectsReport", () => {
   });
 
   it("rejects entries missing a slug or url", async () => {
-    const res = await handleSubjectsReport(
-      post("https://x/report", { items: [{ slug: "" }, { url: URL_A }] }),
-      env,
-      "hash-a",
-      sessionData(),
-    );
-    const body = (await res.json()) as { subjects: any[] };
-    expect(body.subjects).toEqual([
-      { slug: "", status: "unknown", reason: "missing_slug_or_url" },
-      { slug: "", status: "unknown", reason: "missing_slug_or_url" },
-    ]);
+    for (const item of [{ slug: "" }, { url: URL_A }]) {
+      const res = await handleSubjectsReport(
+        post("https://x/report", { items: [item] }),
+        env,
+        "hash-a",
+        sessionData(),
+      );
+      const body = (await res.json()) as { subjects: any[] };
+      expect(body.subjects).toEqual([{ slug: "", status: "unknown", reason: "missing_slug_or_url" }]);
+    }
   });
 });
 

@@ -302,6 +302,18 @@ describe("write rate limit", () => {
 });
 
 describe("DELETE", () => {
+  it("signing out is never rate limited: a 429 there left the token valid", async () => {
+    const rl = new FakeRateLimit();
+    rl.denyAll = true;
+    const { env, kv } = setup({ A: 1 }, { WRITE_RL: rl });
+    const res = await call(env, { method: "DELETE" });
+    expect(res.status).toBe(200);
+    expect(kv.json(LOGIN)).toMatchObject({ sessionTokens: ["session-c2"] });
+    // Wipe all data still is
+    const wipe = await call(env, { method: "DELETE", query: "&all=true", session: "session-c2" });
+    expect(wipe.status).toBe(429);
+  });
+
   it("removes the calling session only", async () => {
     const { env, kv } = setup({ A: 1 });
     const res = await call(env, { method: "DELETE" });
