@@ -3,15 +3,23 @@ import {
   INTRA_ISSUER,
   JWKS_REFRESH_MIN_INTERVAL_MS,
   MAX_AUTH_BODY_BYTES,
+  azpAllowed,
   handleIntraAuth,
   resetJwksRefreshThrottle,
   verifyIntraJwt,
   type Jwk,
 } from "../src/handlers/intra-auth";
+import worker from "../src/index";
 import type { Env } from "../src/types";
 import { LIMITS, resetRateLimits } from "../src/rate-limit";
-import { hashLogin } from "../src/utils";
-import { FakeD1, FakeRateLimit } from "./helpers/fake-env";
+import {
+  LEGACY_SESSION_CREATED_AT,
+  MAX_SESSIONS,
+  SESSION_MAX_AGE_MS,
+} from "../src/sessions";
+import { FETCH_DEADLINES, hashLogin, KV_RETRY } from "../src/utils";
+import { BUDGET_ALL, DAILY_KV_WRITES_SIGN_IN, utcDay } from "../src/budget";
+import { FakeD1, FakeRateLimit, addSession, hangingFetch, stalledBody, tokenHash } from "./helpers/fake-env";
 
 // Node 20+ exposes WebCrypto globally, like the Workers runtime does.
 const subtle = crypto.subtle;
@@ -46,6 +54,8 @@ const now = 1_800_000_000_000; // fixed "now" in ms
 const validPayload = () => ({
   iss: INTRA_ISSUER,
   sub: "abc-123",
+  // the Intra v3 front-end's client, as in its public bundle
+  azp: "frontend-react",
   preferred_username: "alepayen",
   exp: Math.floor(now / 1000) + 300,
 });
@@ -100,11 +110,13 @@ describe("verifyIntraJwt", () => {
 // handleIntraAuth: JWKS caching and refresh throttling
 // ---------------------------------------------------------------------------
 
-function makeEnv(kvSeed: Record<string, unknown> = {}) {
+function makeEnv(kvSeed: Record<string, unknown> = {}, vars: Partial<Env> = {}) {
   const kv = new Map<string, string>(
     Object.entries(kvSeed).map(([k, v]) => [k, JSON.stringify(v)]),
   );
   const puts: string[] = [];
+  // Sessions live in D1: a real SQLite with the migrations applied.
+  const d1 = new FakeD1();
   const env = {
     BETTER_INTRA_KV: {
       get: async (key: string, opts?: { type?: string }) => {
@@ -121,11 +133,12 @@ function makeEnv(kvSeed: Record<string, unknown> = {}) {
         kv.delete(key);
       },
     },
-    better_intra_d1: {
-      prepare: () => ({ bind: () => ({ run: async () => ({}) }) }),
-    },
+    better_intra_d1: d1,
+    // as in wrangler.json
+    JWT_ALLOWED_AZP: "frontend-react",
+    ...vars,
   } as unknown as Env;
-  return { env, kv, puts };
+  return { env, kv, puts, d1 };
 }
 
 const authRequest = (token: string) =>
@@ -280,6 +293,51 @@ describe("handleIntraAuth JWKS handling", () => {
   });
 });
 
+describe("handleIntraAuth JWKS deadline", () => {
+  const DEADLINE = FETCH_DEADLINES.jwksMs;
+
+  beforeEach(() => {
+    // Date only: the deadline runs on real timers
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    resetJwksRefreshThrottle();
+    resetRateLimits();
+    FETCH_DEADLINES.jwksMs = 20;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    FETCH_DEADLINES.jwksMs = DEADLINE;
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("answers the key server's 503 when auth.42.fr never answers, not the client's timeout", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(hangingFetch(calls)));
+    const { env, puts } = makeEnv();
+    const res = await handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({
+      error: "server_error",
+      message: "Intra key server unreachable, retry in a minute",
+    });
+    expect(calls).toEqual(["https://auth.42.fr/auth/realms/students-42/protocol/openid-connect/certs"]);
+    expect(puts).toEqual([]);
+  });
+
+  it("answers 503 too when the key set stalls mid-body", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => stalledBody(init, '{"keys":[')),
+    );
+    const { env } = makeEnv();
+    const res = await handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env);
+    expect(res.status).toBe(503);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // handleIntraAuth: rate limits
 // ---------------------------------------------------------------------------
@@ -345,6 +403,21 @@ describe("handleIntraAuth rate limits", () => {
     expect((await handleIntraAuth(fromIp(forged, "10.0.0.2"), env)).status).toBe(401);
   });
 
+  it("counts the addresses of one IPv6 /64 as one client", async () => {
+    const { env } = makeEnv({ INTRA_JWKS_CACHE: otherJwks });
+    const { priv: attackerKey } = await makeKey("x");
+    const forged = await sign(validPayload(), attackerKey, "k-unknown");
+    // one host rotating its source address inside its own /64
+    for (let i = 0; i < LIMITS.anon.limit; i++) {
+      const ip = `2a01:cb10:793:3f00::${(i + 1).toString(16)}`;
+      expect((await handleIntraAuth(fromIp(forged, ip), env)).status).toBe(401);
+    }
+    const sameHost = fromIp(forged, "2A01:CB10:0793:3F00:aaaa:bbbb:cccc:dddd");
+    expect((await handleIntraAuth(sameHost, env)).status).toBe(429);
+    // the next /64 is another client
+    expect((await handleIntraAuth(fromIp(forged, "2a01:cb10:793:3f01::1"), env)).status).toBe(401);
+  });
+
   it("never refuses for a missing address (local dev) and forged tokens cost no write", async () => {
     const { env, puts } = makeEnv({ INTRA_JWKS_CACHE: jwks });
     const { priv: attackerKey } = await makeKey("x");
@@ -383,19 +456,16 @@ describe("handleIntraAuth users row", () => {
   };
 
   it("answers the session even when the users row cannot be written", async () => {
-    const { env, kv } = makeEnv({ INTRA_JWKS_CACHE: jwks });
-    (env as { better_intra_d1: unknown }).better_intra_d1 = {
-      prepare: () => {
-        throw new Error("D1_ERROR: Network connection lost.");
-      },
-    };
+    const { env, d1 } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    d1.raw.exec("DROP TABLE users");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const res = await handleIntraAuth(fromFrance(await sign(validPayload(), privateKey)), env);
     expect(res.status).toBe(200);
     const { token } = (await res.json()) as { token: string };
-    // the token the extension receives is the one stored, and it is the only one
-    const record = JSON.parse(kv.get(await hashLogin("alepayen"))!);
-    expect(record.sessionTokens).toEqual([token]);
+    // the token the extension receives is the one stored (hashed), the only one
+    expect(
+      d1.rows("SELECT token_hash FROM sessions WHERE login_hash = ?", await hashLogin("alepayen")),
+    ).toEqual([{ token_hash: tokenHash(token) }]);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("users row"));
   });
 
@@ -499,5 +569,310 @@ describe("handleIntraAuth body cap", () => {
       const req = new Request("https://worker.test/auth/intra", { method: "POST", body: raw });
       expect((await handleIntraAuth(req, env)).status).toBe(400);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleIntraAuth: the client the token was issued to (azp)
+// ---------------------------------------------------------------------------
+
+describe("handleIntraAuth client pin (azp)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    resetJwksRefreshThrottle();
+    resetRateLimits();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ keys: jwks }), { status: 200 })));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const { azp: _azp, ...noAzp } = validPayload();
+
+  it("reads JWT_ALLOWED_AZP as a comma-separated list; empty or missing checks nothing", () => {
+    expect(azpAllowed("frontend-react", "frontend-react")).toBe(true);
+    expect(azpAllowed("frontend-react", " other-client , frontend-react ")).toBe(true);
+    expect(azpAllowed("intra", "frontend-react")).toBe(false);
+    expect(azpAllowed(undefined, "frontend-react")).toBe(false);
+    expect(azpAllowed(["frontend-react"], "frontend-react")).toBe(false);
+    expect(azpAllowed(undefined, "")).toBe(true);
+    expect(azpAllowed("intra", undefined)).toBe(true);
+    expect(azpAllowed("intra", " , ")).toBe(true);
+  });
+
+  it("refuses a genuine token of another client, or of none, with the invalid-token 401 and no write", async () => {
+    const { env, puts, d1 } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const foreign = await handleIntraAuth(
+      authRequest(await sign({ ...validPayload(), iss: "https://evil.example/realm" }, privateKey)),
+      env,
+    );
+    const invalid = { status: foreign.status, body: await foreign.text() };
+    expect(invalid.status).toBe(401);
+    // "intra" is the v2 server-side client of the same realm
+    for (const payload of [{ ...validPayload(), azp: "intra" }, noAzp]) {
+      const res = await handleIntraAuth(authRequest(await sign(payload, privateKey)), env);
+      expect({ status: res.status, body: await res.text() }).toEqual(invalid);
+    }
+    expect(puts).toEqual([]);
+    expect(d1.rows("SELECT * FROM sessions")).toEqual([]);
+    // a 42 rename shows up in the logs: the client id, never the login
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('"intra"'));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('"none"'));
+    for (const [line] of warn.mock.calls) expect(String(line)).not.toContain("alepayen");
+  });
+
+  it("lets every client in when the variable is empty, and any client of the list", async () => {
+    const open = makeEnv({ INTRA_JWKS_CACHE: jwks }, { JWT_ALLOWED_AZP: "" });
+    expect((await handleIntraAuth(authRequest(await sign(noAzp, privateKey)), open.env)).status).toBe(200);
+    const listed = makeEnv({ INTRA_JWKS_CACHE: jwks }, { JWT_ALLOWED_AZP: "frontend-react,intra" });
+    const intra = await sign({ ...validPayload(), azp: "intra" }, privateKey);
+    expect((await handleIntraAuth(authRequest(intra), listed.env)).status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleIntraAuth: the KV record and the D1 sessions
+// ---------------------------------------------------------------------------
+
+describe("sign-in record and sessions", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    resetJwksRefreshThrottle();
+    resetRateLimits();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ keys: jwks }), { status: 200 })));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  async function signIn(env: Env): Promise<string> {
+    const res = await handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env);
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { token: string }).token;
+  }
+
+  const sessionRows = (d1: FakeD1, hash: string) =>
+    d1.rows(
+      "SELECT token_hash, created_at FROM sessions WHERE login_hash = ? ORDER BY created_at, token_hash",
+      hash,
+    );
+
+  it("leaves an existing record alone: settings kept, no KV write, the ten newest sessions kept", async () => {
+    const hash = await hashLogin("alepayen");
+    const legacy = Array.from({ length: 10 }, (_, i) => `legacy-token-${i}`);
+    const { env, kv, d1, puts } = makeEnv({
+      INTRA_JWKS_CACHE: jwks,
+      [hash]: { sessionTokens: legacy, settings: { A: 1, CUSTOM_CSS: "x" } },
+    });
+    const before = kv.get(hash);
+    const token = await signIn(env);
+
+    // the settings every restore and every visitor read are not rewritten
+    expect(kv.get(hash)).toBe(before);
+    expect(puts).not.toContain(hash);
+    // the ten legacy tokens were copied, then the oldest one made room
+    const rows = sessionRows(d1, hash);
+    expect(rows).toHaveLength(MAX_SESSIONS);
+    expect(rows.map((r) => r.token_hash)).not.toContain(tokenHash(legacy[0]));
+    expect(rows[0]).toEqual({
+      token_hash: tokenHash(legacy[1]),
+      created_at: LEGACY_SESSION_CREATED_AT + 1,
+    });
+    expect(rows.at(-1)).toEqual({ token_hash: tokenHash(token), created_at: now });
+  });
+
+  it("copies a legacy single sessionToken and keeps the record untouched", async () => {
+    const hash = await hashLogin("alepayen");
+    const { env, kv, d1 } = makeEnv({
+      INTRA_JWKS_CACHE: jwks,
+      [hash]: { sessionToken: "old-session", settings: { B: 2 } },
+    });
+    const token = await signIn(env);
+    expect(sessionRows(d1, hash).map((r) => r.token_hash).sort()).toEqual(
+      [tokenHash("old-session"), tokenHash(token)].sort(),
+    );
+    expect(JSON.parse(kv.get(hash)!)).toEqual({ sessionToken: "old-session", settings: { B: 2 } });
+  });
+
+  it("keeps the earlier sessions working: after two sign-ins every token reads the settings", async () => {
+    const hash = await hashLogin("alepayen");
+    const { env } = makeEnv({
+      INTRA_JWKS_CACHE: jwks,
+      [hash]: { sessionTokens: ["legacy-a"], settings: { A: 1 } },
+    });
+    const first = await signIn(env);
+    const second = await signIn(env);
+    for (const token of [first, second, "legacy-a"]) {
+      const res = await worker.fetch(
+        new Request(`https://w.test/api/v1/private/settings?login=${hash}`, {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        env,
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ settings: { A: 1 }, activeSessions: 3, discordId: null, rev: 0 });
+    }
+  });
+
+  it("creates the record on a first sign-in, with no token in it, and later sign-ins write no KV", async () => {
+    const hash = await hashLogin("alepayen");
+    const { env, kv, d1, puts } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    const token = await signIn(env);
+    expect(JSON.parse(kv.get(hash)!)).toEqual({ settings: {} });
+    for (const value of kv.values()) expect(value).not.toContain(token);
+    expect(d1.rows("SELECT login_hash FROM session_migrations")).toEqual([{ login_hash: hash }]);
+    const writes = puts.length;
+    await signIn(env);
+    expect(puts.length).toBe(writes);
+    expect(sessionRows(d1, hash)).toHaveLength(2);
+  });
+
+  it("does not take a miss next to a live session for a first sign-in", async () => {
+    // A location that cached "no such key" before the first sign-in may
+    // still answer null: writing {settings: {}} then would erase the backup.
+    const hash = await hashLogin("alepayen");
+    const { env, d1, puts } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    addSession(d1, hash, "earlier-session", now - 1000);
+    await signIn(env);
+    expect(puts).not.toContain(hash);
+    expect(sessionRows(d1, hash)).toHaveLength(2);
+  });
+
+  it("spends no KV write when the session cannot be stored", async () => {
+    const { env, d1, puts } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    d1.raw.exec("DROP TABLE sessions");
+    await expect(
+      handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env),
+    ).rejects.toThrow();
+    expect(puts).toEqual([]);
+  });
+
+  it("drops the expired sessions and all but the ten newest on each sign-in", async () => {
+    const hash = await hashLogin("alepayen");
+    const { env, d1 } = makeEnv({ INTRA_JWKS_CACHE: jwks, [hash]: { settings: {} } });
+    d1.raw.exec(`INSERT INTO session_migrations (login_hash, migrated_at) VALUES ('${hash}', 0)`);
+    const insert = d1.raw.prepare(
+      "INSERT INTO sessions (login_hash, token_hash, created_at) VALUES (?, ?, ?)",
+    );
+    insert.run(hash, "expired", now - SESSION_MAX_AGE_MS - 1);
+    for (let i = 0; i < MAX_SESSIONS; i++) insert.run(hash, `live-${i}`, now - 1000 + i);
+    const token = await signIn(env);
+    const kept = sessionRows(d1, hash).map((r) => r.token_hash);
+    expect(kept).toHaveLength(MAX_SESSIONS);
+    expect(kept).not.toContain("expired");
+    expect(kept).not.toContain("live-0");
+    expect(kept.at(-1)).toBe(tokenHash(token));
+  });
+});
+
+describe("first sign-in record: daily budget and KV busy", () => {
+  beforeEach(() => {
+    // Date only: the KV retry waits on a real (zero) timer
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(now);
+    resetJwksRefreshThrottle();
+    resetRateLimits();
+    KV_RETRY.delayMs = 0;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ keys: jwks }), { status: 200 })));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    KV_RETRY.delayMs = 1100;
+  });
+
+  async function signIn(env: Env): Promise<string> {
+    const res = await handleIntraAuth(authRequest(await sign(validPayload(), privateKey)), env);
+    expect(res.status).toBe(200);
+    return ((await res.json()) as { token: string }).token;
+  }
+
+  async function settingsOf(env: Env, hash: string, token: string) {
+    const res = await worker.fetch(
+      new Request(`https://w.test/api/v1/private/settings?login=${hash}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      env,
+    );
+    return { status: res.status, body: await res.json() };
+  }
+
+  it("counts the record in the budget, with the sign-in's own cap", async () => {
+    const hash = await hashLogin("alepayen");
+    const { env, d1, puts } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    // past the pushes' 900, below the sign-ins' 980
+    d1.raw
+      .prepare("INSERT INTO kv_write_budget (day, login_hash, n) VALUES (?, ?, ?)")
+      .run(utcDay(now), BUDGET_ALL, 950);
+    await signIn(env);
+    expect(puts).toContain(hash);
+    expect(d1.rows("SELECT n FROM kv_write_budget WHERE login_hash = ?", hash)).toEqual([{ n: 1 }]);
+  });
+
+  it("signs in anyway past the budget, and leaves the record to the first push", async () => {
+    const hash = await hashLogin("alepayen");
+    const { env, d1, puts } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    d1.raw
+      .prepare("INSERT INTO kv_write_budget (day, login_hash, n) VALUES (?, ?, ?)")
+      .run(utcDay(now), BUDGET_ALL, DAILY_KV_WRITES_SIGN_IN);
+    const token = await signIn(env);
+    expect(puts).not.toContain(hash);
+    // the session works, and reads as empty settings
+    expect(await settingsOf(env, hash, token)).toEqual({
+      status: 200,
+      body: { settings: {}, activeSessions: 1, discordId: null, rev: 0 },
+    });
+  });
+
+  it("retries a record KV refused for the per-key limit, and never overwrites one written meanwhile", async () => {
+    const hash = await hashLogin("alepayen");
+    const first = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    const put = first.env.BETTER_INTRA_KV.put.bind(first.env.BETTER_INTRA_KV);
+    let refusals = 1;
+    first.env.BETTER_INTRA_KV.put = (async (key: string, value: string) => {
+      if (key === hash && refusals-- > 0) throw new Error("KV PUT failed: 429 Too Many Requests");
+      return put(key, value);
+    }) as typeof put;
+    await signIn(first.env);
+    expect(JSON.parse(first.kv.get(hash)!)).toEqual({ settings: {} });
+
+    // refused, and the student's first push landed in that second
+    // (KV takes the retry: only the re-read keeps it from overwriting)
+    const second = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    let refused = false;
+    second.env.BETTER_INTRA_KV.put = (async (key: string, value: string) => {
+      if (key === hash && !refused) {
+        refused = true;
+        second.kv.set(hash, JSON.stringify({ settings: { THEME: "pushed" }, settingsRev: 5 }));
+        throw new Error("KV PUT failed: 429 Too Many Requests");
+      }
+      second.kv.set(key, value);
+    }) as typeof put;
+    await signIn(second.env);
+    expect(JSON.parse(second.kv.get(hash)!)).toEqual({ settings: { THEME: "pushed" }, settingsRev: 5 });
+  });
+
+  it("signs in anyway when KV refuses the record twice", async () => {
+    const hash = await hashLogin("alepayen");
+    const { env, kv } = makeEnv({ INTRA_JWKS_CACHE: jwks });
+    const put = env.BETTER_INTRA_KV.put.bind(env.BETTER_INTRA_KV);
+    env.BETTER_INTRA_KV.put = (async (key: string, value: string) => {
+      if (key === hash) throw new Error("KV PUT failed: 429 Too Many Requests");
+      return put(key, value);
+    }) as typeof put;
+    const token = await signIn(env);
+    expect(kv.has(hash)).toBe(false);
+    expect((await settingsOf(env, hash, token)).status).toBe(200);
   });
 });

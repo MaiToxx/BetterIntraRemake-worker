@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy --remote",
+    "deploy": "node scripts/deploy.mjs",
+    "typecheck": "tsc --noEmit -p .",
     "cf-typegen": "wrangler types",
     "test": "vitest run",
     "test:watch": "vitest"

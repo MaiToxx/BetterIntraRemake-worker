@@ -2,6 +2,8 @@
   "name": "betterintra-remake",
   "main": "src/index.ts",
   "compatibility_date": "2026-03-01",
+  "workers_dev": true,
+  "preview_urls": false,
   "kv_namespaces": [
     {
       "binding": "BETTER_INTRA_KV",
@@ -12,9 +14,13 @@
     {
       "binding": "better_intra_d1",
       "database_name": "better-intra-d1",
-      "database_id": "93d714a6-f83a-4aa3-be0e-3a09d6277035"
+      "database_id": "93d714a6-f83a-4aa3-be0e-3a09d6277035",
+      "migrations_dir": "migrations"
     }
   ],
+  "vars": {
+    "JWT_ALLOWED_AZP": "frontend-react"
+  },
   "ratelimits": [
     {
       "name": "WRITE_RL",
@@ -30,6 +36,11 @@
       "name": "VISUALS_RL",
       "namespace_id": "1003",
       "simple": { "limit": 120, "period": 60 }
+    },
+    {
+      "name": "ADMIN_RL",
+      "namespace_id": "1004",
+      "simple": { "limit": 5, "period": 60 }
     }
   ],
   "triggers": {

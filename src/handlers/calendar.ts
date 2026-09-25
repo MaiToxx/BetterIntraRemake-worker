@@ -1,11 +1,13 @@
-import { Env, UserData } from "../types";
+import { Env } from "../types";
 import { rateLimited, tooManyRes } from "../rate-limit";
+import { recordLoader, requireSession, type RecordSource } from "../sessions";
 import {
   corsHeaders,
+  errorRes,
   jsonRes,
+  methodNotAllowedRes,
+  notFoundRes,
   readJsonBody,
-  requireSession,
-  textRes,
 } from "../utils";
 
 /**
@@ -23,22 +25,25 @@ export const MAX_ICS_BYTES = 256 * 1024;
  * (revoked_at set): nobody can register it again and feed their own events to
  * the calendars still subscribed to it.
  *
- * The legacy KV keys are still read, for links made before this table existed,
- * but only while their login has no row here: the first new link (or a wipe)
- * retires every legacy link of that login at once, including the ones nobody
- * can name any more.
+ * Those legacy KV keys are no longer read: the live namespace holds none
+ * (checked 2026-09-25), so every link that works has a row here, and a feed
+ * or a registration costs no KV read.
  */
-const LEGACY_PREFIX = "CALENDAR_TOKEN_";
 
 /** What the extension generates (crypto.randomUUID()), with room to spare. */
 const NEW_TOKEN_RE = /^[A-Za-z0-9_-]{16,128}$/;
 
+/** A secret link read by its owner: never kept by a cache on the way. */
+const NO_STORE = { "Cache-Control": "no-store" };
+
 const ensuredDbs = new WeakSet<object>();
 
 /**
- * Created on first use like students_cache: a deploy does not run schema.sql.
- * Called on every path, reads included, so that a missing table never reads
- * as "no link" and lets a retired legacy link through.
+ * Created on first use, from before migrations/ existed: a deploy does not
+ * apply migrations. Kept until migrations/0001_baseline.sql is confirmed
+ * applied on the live database, then to be removed with its test. Called on
+ * every path, reads included, so that a missing table never reads as "no
+ * link".
  */
 async function ensureTokensTable(env: Env): Promise<void> {
   const db = env.better_intra_d1;
@@ -54,73 +59,47 @@ async function ensureTokensTable(env: Env): Promise<void> {
   ensuredDbs.add(db);
 }
 
-/** Login hash a legacy KV link points to, or null. */
-async function readLegacyOwner(
+/**
+ * The login's live link, or null (never made one, stopped, wiped). The
+ * `wiped:` marker rows an earlier worker wrote always have revoked_at set,
+ * so they never come back as a link.
+ */
+export async function liveCalendarToken(
   env: Env,
-  token: string,
+  loginHash: string,
 ): Promise<string | null> {
-  const raw = await env.BETTER_INTRA_KV.get(`${LEGACY_PREFIX}${token}`);
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    return typeof parsed?.login === "string"
-      ? parsed.login
-      : typeof parsed === "string"
-        ? parsed
-        : raw;
-  } catch {
-    return raw;
-  }
+  await ensureTokensTable(env);
+  const row = await env.better_intra_d1
+    .prepare(
+      "SELECT token FROM calendar_tokens WHERE login_hash = ? AND revoked_at IS NULL LIMIT 1",
+    )
+    .bind(loginHash)
+    .first<{ token: string }>();
+  return row?.token ?? null;
 }
 
-/**
- * Statements retiring the legacy link named in the user's synced settings
- * (CALENDAR_SYNC_TOKEN), when it really is theirs: settings are written by the
- * client, so a token found there must not let anyone delete someone else's
- * link. The tombstone row keeps the token from being registered again once its
- * KV key is gone.
- */
-async function legacyRetirement(
+/** Whether the login has a live link, and a stored calendar (the export). */
+export async function calendarState(
   env: Env,
-  loginParam: string,
-  settings: Record<string, unknown> | undefined,
-  keep?: string,
-): Promise<{ stmts: D1PreparedStatement[]; kvKey: string | null }> {
-  const named = settings?.CALENDAR_SYNC_TOKEN;
-  if (typeof named !== "string" || named.length < 8 || named === keep) {
-    return { stmts: [], kvKey: null };
-  }
-  if ((await readLegacyOwner(env, named)) !== loginParam) {
-    return { stmts: [], kvKey: null };
-  }
-  return {
-    stmts: [
-      env.better_intra_d1
-        .prepare(
-          "INSERT OR IGNORE INTO calendar_tokens (token, login_hash, revoked_at) VALUES (?, ?, unixepoch())",
-        )
-        .bind(named, loginParam),
-    ],
-    kvKey: `${LEGACY_PREFIX}${named}`,
-  };
-}
-
-/**
- * Best effort: once the D1 rows are written the link already answers 404, and
- * a KV delete over the daily limit must not turn a done revocation into an
- * error (the extension would keep showing the dead link as current).
- */
-async function deleteLegacyKey(env: Env, kvKey: string | null): Promise<void> {
-  if (!kvKey) return;
-  try {
-    await env.BETTER_INTRA_KV.delete(kvKey);
-  } catch (e) {
-    console.warn(`[calendar] legacy key delete failed: ${e}`);
-  }
+  loginHash: string,
+): Promise<{ live: boolean; feedStored: boolean }> {
+  await ensureTokensTable(env);
+  const row = await env.better_intra_d1
+    .prepare(
+      "SELECT EXISTS (SELECT 1 FROM calendar_tokens WHERE login_hash = ? AND revoked_at IS NULL) AS live, EXISTS (SELECT 1 FROM calendar_ics WHERE login_hash = ?) AS feed",
+    )
+    .bind(loginHash, loginHash)
+    .first<{ live: number; feed: number }>();
+  return { live: !!row?.live, feedStored: !!row?.feed };
 }
 
 /**
  * /api/v1/private/calendar/token?login=<hash>
+ *  - GET: {"token": <the live link's token> | null}. Only the browser that
+ *    made a link used to know it: another one offered "Generate", which
+ *    revoked the link a phone was subscribed to, and a regenerated or
+ *    stopped link kept showing there. No write and no rate limit: the
+ *    session holder can already read the synced copy, and regenerate it.
  *  - POST {token}: registers a new link, which revokes the previous one.
  *  - DELETE: "Stop sharing". Revokes the link and deletes the stored
  *    calendar (204), without the rest of "Wipe all data": until then the
@@ -131,19 +110,23 @@ export async function handleCalendarToken(
   request: Request,
   env: Env,
   loginParam: string,
-  existingData: UserData | null,
+  source: RecordSource,
 ): Promise<Response> {
-  if (request.method !== "POST" && request.method !== "DELETE") {
-    return textRes("Method not allowed", 405);
+  if (!["GET", "POST", "DELETE"].includes(request.method)) {
+    return methodNotAllowedRes();
   }
 
-  const denied = requireSession(request, existingData);
+  // The session alone: none of these paths reads the KV record any more.
+  const denied = await requireSession(request, env, loginParam, recordLoader(source));
   if (denied) return denied;
-  const record = existingData as UserData;
+
+  if (request.method === "GET") {
+    return jsonRes({ token: await liveCalendarToken(env, loginParam) }, 200, NO_STORE);
+  }
 
   if (request.method === "DELETE") {
     if (await rateLimited(env, "write", loginParam)) return tooManyRes();
-    await deleteCalendarData(env, loginParam, record.settings);
+    await deleteCalendarData(env, loginParam);
     return new Response(null, { status: 204, headers: corsHeaders });
   }
 
@@ -156,7 +139,7 @@ export async function handleCalendarToken(
 
   const token = body.value?.token;
   if (typeof token !== "string" || !NEW_TOKEN_RE.test(token)) {
-    return textRes("Invalid token", 400);
+    return errorRes("bad_request", "Invalid token", 400);
   }
 
   await ensureTokensTable(env);
@@ -175,21 +158,11 @@ export async function handleCalendarToken(
     if (row.login_hash === loginParam && row.revoked_at === null) {
       return jsonRes({ ok: true });
     }
-    return textRes("Token already in use", 409);
-  }
-  const legacyOwner = await readLegacyOwner(env, token);
-  if (legacyOwner !== null && legacyOwner !== loginParam) {
-    return textRes("Token already in use", 409);
+    return errorRes("conflict", "Token already in use", 409);
   }
 
   if (await rateLimited(env, "write", loginParam)) return tooManyRes();
 
-  const legacy = await legacyRetirement(
-    env,
-    loginParam,
-    record.settings,
-    token,
-  );
   await db.batch([
     // "New link invalidates the old one": the previous link stops here
     db
@@ -197,61 +170,55 @@ export async function handleCalendarToken(
         "UPDATE calendar_tokens SET revoked_at = unixepoch() WHERE login_hash = ? AND revoked_at IS NULL",
       )
       .bind(loginParam),
-    ...legacy.stmts,
     db
       .prepare("INSERT INTO calendar_tokens (token, login_hash) VALUES (?, ?)")
       .bind(token, loginParam),
   ]);
-  await deleteLegacyKey(env, legacy.kvKey);
 
   return jsonRes({ ok: true });
 }
 
 /**
  * "Wipe all data" and "Stop sharing": revokes every calendar link of the
- * login and deletes the stored calendar. The marker row matters for a login
- * that only ever had legacy links: without a row here, those would keep
- * answering once the user signs in again. It also makes the login read as
- * stopped for handleCalendarUpdate until a new link is registered. A login
- * that already has rows gets no marker: they are all revoked by then, and
- * "Stop sharing" clicked again must not add a row each time.
+ * login and deletes the stored calendar. A login with no link row gets none:
+ * an earlier worker inserted a revoked `wiped:<uuid>` marker there, so that a
+ * legacy KV link (CALENDAR_TOKEN_*, which had no row) read as stopped. Those
+ * links are gone, so the marker only left a new, permanent row naming the
+ * login in a database the wipe had just taken it out of, for every student
+ * who never used the calendar. Such a login holds no link to upload with
+ * (the extension stores one only once POST /token succeeded), and
+ * handleCalendarUpdate still answers 410 to every login whose rows are all
+ * revoked. Markers already written stay revoked and inert.
  */
 export async function deleteCalendarData(
   env: Env,
   loginParam: string,
-  settings: Record<string, unknown> | undefined,
 ): Promise<void> {
   await ensureTokensTable(env);
   const db = env.better_intra_d1;
-  const legacy = await legacyRetirement(env, loginParam, settings);
   await db.batch([
     db
       .prepare(
         "UPDATE calendar_tokens SET revoked_at = unixepoch() WHERE login_hash = ? AND revoked_at IS NULL",
       )
       .bind(loginParam),
-    ...legacy.stmts,
-    db
-      .prepare(
-        "INSERT INTO calendar_tokens (token, login_hash, revoked_at) SELECT ?, ?, unixepoch() WHERE NOT EXISTS (SELECT 1 FROM calendar_tokens WHERE login_hash = ?)",
-      )
-      .bind(`wiped:${crypto.randomUUID()}`, loginParam, loginParam),
     db
       .prepare("DELETE FROM calendar_ics WHERE login_hash = ?")
       .bind(loginParam),
   ]);
-  await deleteLegacyKey(env, legacy.kvKey);
 }
 
 export async function handleCalendarUpdate(
   request: Request,
   env: Env,
   loginParam: string,
-  existingData: UserData | null,
+  source: RecordSource,
 ): Promise<Response> {
-  if (request.method !== "POST") return textRes("Method not allowed", 405);
+  if (request.method !== "POST") return methodNotAllowedRes();
 
-  const denied = requireSession(request, existingData);
+  // The session alone: once the login's sessions are in D1, this path (taken
+  // on profile visits) reads no KV record.
+  const denied = await requireSession(request, env, loginParam, recordLoader(source));
   if (denied) return denied;
 
   const body = await readJsonBody<{ ics?: unknown }>(
@@ -263,7 +230,7 @@ export async function handleCalendarUpdate(
 
   const ics = body.value?.ics;
   if (typeof ics !== "string" || ics.length < 50) {
-    return textRes("Invalid ics body", 400);
+    return errorRes("bad_request", "Invalid ics body", 400);
   }
 
   if (await rateLimited(env, "write", loginParam)) return tooManyRes();
@@ -272,9 +239,9 @@ export async function handleCalendarUpdate(
   // keeps uploading on every profile visit after "Stop sharing". Nobody could
   // read that copy (no live link), but the timetable the student took off the
   // server would be back on it. So the row is only written while the login
-  // has a live link, or no link row at all (legacy KV links only, or none
-  // yet). One statement rather than a check then a write: a stop landing in
-  // between would be undone by the write.
+  // has a live link, or no link row at all (none registered yet). One
+  // statement rather than a check then a write: a stop landing in between
+  // would be undone by the write.
   await ensureTokensTable(env);
   const { meta } = await env.better_intra_d1
     .prepare(
@@ -284,7 +251,13 @@ export async function handleCalendarUpdate(
     .run();
   // Strictly 0: the 410 makes the extension forget its link, so a result
   // that says nothing must not read as "stopped".
-  if (meta.changes === 0) return jsonRes({ error: "calendar_stopped" }, 410);
+  if (meta.changes === 0) {
+    return errorRes(
+      "calendar_stopped",
+      "Calendar sharing was stopped: make a new link to share again",
+      410,
+    );
+  }
 
   return jsonRes({ ok: true });
 }
@@ -295,30 +268,13 @@ async function resolveCalendarToken(
   env: Env,
 ): Promise<string | null> {
   await ensureTokensTable(env);
-  const db = env.better_intra_d1;
-  const row = await db
+  const row = await env.better_intra_d1
     .prepare(
       "SELECT login_hash, revoked_at FROM calendar_tokens WHERE token = ?",
     )
     .bind(token)
     .first<{ login_hash: string; revoked_at: number | null }>();
-  if (row) return row.revoked_at === null ? row.login_hash : null;
-
-  const login = await readLegacyOwner(env, token);
-  if (!login) return null;
-  // Any row for this login (live, revoked or wipe marker) supersedes all of
-  // its legacy links.
-  const newer = await db
-    .prepare(
-      "SELECT 1 AS found FROM calendar_tokens WHERE login_hash = ? LIMIT 1",
-    )
-    .bind(login)
-    .first<{ found: number }>();
-  if (newer) return null;
-  // Before this table, "Wipe all data" only deleted the user record: honour
-  // those wipes too.
-  const user = await env.BETTER_INTRA_KV.get(login);
-  return user ? login : null;
+  return row && row.revoked_at === null ? row.login_hash : null;
 }
 
 export async function handleCalendarIcs(
@@ -326,11 +282,11 @@ export async function handleCalendarIcs(
   env: Env,
 ): Promise<Response> {
   if (!token || token.length < 8 || token.length > 200) {
-    return textRes("Invalid token", 404);
+    return notFoundRes();
   }
 
   const login = await resolveCalendarToken(token, env);
-  if (!login) return textRes("Not found", 404);
+  if (!login) return notFoundRes();
 
   const row = await env.better_intra_d1
     .prepare("SELECT ics_body FROM calendar_ics WHERE login_hash = ?")

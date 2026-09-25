@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/types";
 import { FakeKV, FakeRateLimit, makeEnv } from "./helpers/fake-env";
+import { readFixture } from "./helpers/fixtures";
 import { LIMITS, resetRateLimits } from "../src/rate-limit";
 
 const LOGIN = "d".repeat(64);
@@ -134,6 +135,9 @@ describe("CORS preflight", () => {
       env,
     );
     expect(res.status).toBe(403);
+    // JSON like every error, but nothing that page may read
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
+    expect(await res.json()).toEqual({ error: "unauthorized", message: "Origin not allowed" });
   });
 });
 
@@ -169,7 +173,9 @@ describe("calendar link stop through the router", () => {
 
 describe("unauthenticated bodies", () => {
   it("are capped even without an Origin header, with a readable 413", async () => {
-    const { env, kv } = seeded();
+    // with a secret configured: without one the announcement POST is closed
+    // (403) before its body is read
+    const { env, kv } = seeded({ ANNOUNCEMENT_SECRET: "announce-secret-123" });
     const getSpy = vi.spyOn(kv, "get");
     const huge = JSON.stringify({ token: "x".repeat(1024 * 1024) });
     for (const path of ["/auth/intra", "/api/v1/public/announcement"]) {
@@ -211,8 +217,8 @@ describe("login parameter", () => {
 });
 
 describe("private routes without a Bearer token", () => {
-  it("answer 401 before the KV read, identical to a wrong token or an unknown login", async () => {
-    const { env, kv } = seeded();
+  it("answer 401 before any KV or D1 read, identical to a wrong token or an unknown login", async () => {
+    const { env, kv, d1 } = seeded();
     const getSpy = vi.spyOn(kv, "get");
     const anonymous = await worker.fetch(
       new Request(`https://w.test/api/v1/private/settings?login=${LOGIN}`),
@@ -220,6 +226,7 @@ describe("private routes without a Bearer token", () => {
     );
     expect(anonymous.status).toBe(401);
     expect(getSpy).not.toHaveBeenCalled();
+    expect(d1.prepared).toEqual([]);
 
     const wrongToken = await worker.fetch(
       new Request(`https://w.test/api/v1/private/settings?login=${LOGIN}`, {
@@ -357,6 +364,14 @@ describe("batch public visuals: per-IP limit", () => {
     expect(single.status).toBe(200);
   });
 
+  it("keys an IPv6 client by its /64, so rotating addresses inside it does not help", async () => {
+    const visuals = new FakeRateLimit();
+    const { env } = seeded({ VISUALS_RL: visuals });
+    await batch(env, "2a01:cb10:793:3f00::7");
+    await batch(env, "2a01:cb10:793:3f00:1234:5678:9abc:def0");
+    expect(visuals.calls).toEqual(["2a01:cb10:793:3f00::/64", "2a01:cb10:793:3f00::/64"]);
+  });
+
   it("uses the VISUALS_RL binding when bound, keyed by address", async () => {
     const visuals = new FakeRateLimit();
     visuals.denyAll = true;
@@ -406,14 +421,20 @@ describe("removed routes", () => {
     [`/api/v1/private/outstanding?login=${LOGIN}`, { headers: auth }],
     [`/api/v1/private/proxy?login=${LOGIN}&path=/v2/me`, { headers: auth }],
     ["/api/v1/private/projects/refresh", { method: "POST", body: "{}" }],
+    // never written by any worker, never called by any extension build: it
+    // only cost a KV read per anonymous call
+    ["/api/v1/cluster/svgs", {}],
   ];
 
   for (const [path, init] of cases) {
     it(`${init.method ?? "GET"} ${path.split("?")[0]} is gone`, async () => {
       const { env, kv, d1 } = seeded();
+      kv.data.set("CLUSTER_SVG_URLS", JSON.stringify({ k0: "https://cdn.intra.42.fr/k0.svg" }));
+      const getSpy = vi.spyOn(kv, "get");
       const puts = kv.puts.length;
       const res = await worker.fetch(new Request(`https://w.test${path}`, init), env);
       expect(res.status).toBe(404);
+      expect(getSpy).not.toHaveBeenCalled();
       expect(fetchMock).not.toHaveBeenCalled();
       expect(kv.puts.length).toBe(puts);
       expect(kv.deletes).toEqual([]);
@@ -423,5 +444,83 @@ describe("removed routes", () => {
 
   it("has no scheduled handler any more", () => {
     expect((worker as { scheduled?: unknown }).scheduled).toBeUndefined();
+  });
+});
+
+describe("error bodies", () => {
+  beforeEach(() => resetRateLimits());
+
+  /**
+   * Every error: JSON {error, message}, status unchanged from before codes
+   * existed (the extension decides on the status, and newer builds on the
+   * code, never on the English message).
+   */
+  it("carry a stable code and an English message, with the status each case always had", async () => {
+    const { env } = seeded({ ANON_RL: Object.assign(new FakeRateLimit(), { denyAll: false }) });
+    const auth = { Authorization: `Bearer ${SESSION}` };
+    const cases: Array<[string, RequestInit, number, string]> = [
+      ["/nowhere", {}, 404, "not_found"],
+      ["/api/v1/private/settings", {}, 400, "bad_request"],
+      ["/api/v1/private/settings?login=NOTAHASH", {}, 400, "bad_request"],
+      [`/api/v1/private/settings?login=${LOGIN}`, {}, 401, "unauthorized"],
+      [`/api/v1/private/settings?login=${LOGIN}`, { method: "PUT", headers: auth }, 405, "bad_request"],
+      [`/api/v1/private/settings?login=${LOGIN}`, { method: "POST", headers: auth, body: "[]" }, 400, "bad_request"],
+      [`/api/v1/private/settings?login=${LOGIN}`, { method: "POST", headers: auth, body: "not json" }, 400, "bad_request"],
+      [`/api/v1/private/sessions?login=${LOGIN}`, { method: "DELETE", headers: auth }, 400, "bad_request"],
+      [`/api/v1/private/images?login=${LOGIN}&slot=nope`, { method: "POST", headers: auth }, 400, "bad_request"],
+      [`/api/v1/private/images?login=${LOGIN}&slot=avatar`, { method: "POST", headers: auth, body: "text" }, 415, "unsupported_image_type"],
+      [`/api/v1/private/images?login=${LOGIN}&slot=avatar`, { method: "POST", headers: { ...auth, "Content-Length": String(3 * 1024 * 1024) }, body: readFixture("gps.png") }, 413, "image_too_large"],
+      [`/api/v1/private/calendar/token?login=${LOGIN}`, { method: "POST", headers: auth, body: JSON.stringify({ token: "x" }) }, 400, "bad_request"],
+      [`/api/v1/private/calendar/update?login=${LOGIN}`, { method: "POST", headers: auth, body: JSON.stringify({ ics: "x".repeat(300 * 1024) }) }, 413, "too_large"],
+      [`/api/v1/private/subjects/report?login=${LOGIN}`, { method: "GET", headers: auth }, 405, "bad_request"],
+      [`/api/v1/private/export?login=${LOGIN}`, { method: "DELETE", headers: auth }, 405, "bad_request"],
+      [`/img/${LOGIN}/avatar`, {}, 404, "not_found"],
+      [`/img/${LOGIN}/avatar`, { method: "POST" }, 405, "bad_request"],
+      ["/calendar/unknown-token-1234.ics", {}, 404, "not_found"],
+      ["/api/v1/public/visuals?logins=nothash", {}, 400, "bad_request"],
+      ["/api/v1/public/stats", { method: "POST" }, 405, "bad_request"],
+      ["/api/v1/public/announcement", { method: "PUT" }, 405, "bad_request"],
+      ["/api/v1/public/announcement", { method: "POST", body: JSON.stringify({ secret: "x", message: "m" }) }, 403, "unauthorized"],
+      ["/api/v1/cluster/svg", {}, 400, "bad_request"],
+      ["/api/v1/cluster/svg?url=https://evil.example/a.svg", {}, 400, "bad_request"],
+      ["/gh/..%2Fsecret", {}, 400, "bad_request"],
+      ["/auth/intra", { method: "GET" }, 405, "bad_request"],
+      ["/auth/intra", { method: "POST", body: JSON.stringify({}) }, 400, "bad_request"],
+      ["/auth/intra", { method: "POST", body: JSON.stringify({ token: "x".repeat(40) }) }, 401, "unauthorized"],
+      ["/auth/intra", { method: "POST", body: "x".repeat(40 * 1024) }, 413, "too_large"],
+    ];
+    for (const [path, init, status, code] of cases) {
+      const res = await worker.fetch(new Request(`https://w.test${path}`, init), env);
+      expect({ path, status: res.status }).toEqual({ path, status });
+      expect(res.headers.get("Content-Type"), path).toBe("application/json");
+      expect(res.headers.get("Access-Control-Allow-Origin"), path).toBe("*");
+      const body = (await res.json()) as { error: unknown; message: unknown };
+      expect(body.error, path).toBe(code);
+      expect(typeof body.message, path).toBe("string");
+    }
+  });
+
+  it("keep the rate limit's 429 and the upstream status of the GitHub proxy", async () => {
+    const visuals = new FakeRateLimit();
+    visuals.denyAll = true;
+    const { env } = seeded({ VISUALS_RL: visuals });
+    const limited = await worker.fetch(
+      new Request(`https://w.test/api/v1/public/visuals?logins=${LOGIN}`, {
+        headers: { "CF-Connecting-IP": "203.0.113.9" },
+      }),
+      env,
+    );
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("Retry-After")).toBe("60");
+    expect(((await limited.json()) as { error: string }).error).toBe("rate_limited");
+
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 404 })));
+    try {
+      const missing = await worker.fetch(new Request("https://w.test/gh/campuses/none.json"), env);
+      expect(missing.status).toBe(404);
+      expect(await missing.json()).toEqual({ error: "not_found", message: "Failed to fetch upstream" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

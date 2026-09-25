@@ -3,7 +3,8 @@ import {
   handleClusterSvg,
   isAllowedClusterSvgUrl,
 } from "../src/handlers/clusters";
-import { makeEnv } from "./helpers/fake-env";
+import { FETCH_DEADLINES } from "../src/utils";
+import { hangingFetch, makeEnv, stalledBody } from "./helpers/fake-env";
 
 const SVG = `<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect id="k0r1p1"/></svg>`;
 const MAP_URL = "https://cdn.intra.42.fr/cluster/image/104/k0.svg";
@@ -166,5 +167,61 @@ describe("handleClusterSvg", () => {
       async () => new Response("nope", { status: 404 }),
     );
     expect((await call(MAP_URL)).status).toBe(502);
+  });
+});
+
+describe("handleClusterSvg deadline", () => {
+  const DEADLINE = FETCH_DEADLINES.clusterSvgMs;
+  beforeEach(() => {
+    FETCH_DEADLINES.clusterSvgMs = 20;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    FETCH_DEADLINES.clusterSvgMs = DEADLINE;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("answers 502 when the Intra host never answers, rather than holding the request", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(hangingFetch(calls)));
+    const res = await call(MAP_URL);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "server_error", message: "Fetch failed" });
+    expect(calls).toEqual([MAP_URL]);
+  });
+
+  it("answers 502 for a map that stalls mid-body or a connection that drops", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) =>
+        stalledBody(init, "<svg xmlns='http://www.w3.org/2000/svg'>", { "Content-Type": "image/svg+xml" }),
+      ),
+    );
+    expect((await call(MAP_URL)).status).toBe(502);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("Network connection lost.");
+      }),
+    );
+    expect((await call(MAP_URL)).status).toBe(502);
+  });
+
+  it("bounds a redirect chain with one deadline", async () => {
+    const signals: (AbortSignal | undefined)[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        signals.push(init?.signal ?? undefined);
+        return signals.length === 1
+          ? new Response(null, { status: 302, headers: { Location: "/cluster/image/104/k0-v2.svg" } })
+          : new Response(SVG, { status: 200, headers: { "Content-Type": "image/svg+xml" } });
+      }),
+    );
+    expect((await call(MAP_URL)).status).toBe(200);
+    expect(signals).toHaveLength(2);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+    expect(signals[1]).toBe(signals[0]);
   });
 });

@@ -1,15 +1,33 @@
 import { Env, UserData } from "../types";
 import { deleteCalendarData } from "./calendar";
 import { deleteUserImages } from "./images";
-import { rateLimited, tooManyRes } from "../rate-limit";
+import { budgetRes, spendKvWrite } from "../budget";
+import { clientKey, rateLimited, tooManyRes } from "../rate-limit";
 import {
-  getBearerToken,
-  getTokens,
+  deletePublicRowStatement,
+  readPublicRows,
+  refreshPublicRow,
+  writePublicRow,
+} from "../public-visuals";
+import {
+  authenticate,
+  countSessions,
+  deleteAllSessions,
+  deleteSession,
+  recordLoader,
+  type RecordSource,
+} from "../sessions";
+import {
+  errorRes,
   isLoginHash,
   jsonRes,
+  KV_BUSY,
+  kvBusyRes,
+  methodNotAllowedRes,
   readJsonBody,
-  requireSession,
+  retryKvBusy,
   textRes,
+  unauthorizedRes,
 } from "../utils";
 
 /**
@@ -52,9 +70,9 @@ const MAX_LOOK_STRING = 2048;
 const OBJECT_KEYS = new Set<string>(["CUSTOM_CARDS"]);
 
 /**
- * Bounds of a settings push. The whole record is read on every request that
- * names the user, /api/v1/public/visuals included, so a bloated record slows
- * every visitor of the profile and every friend row: the caps stop abuse,
+ * Bounds of a settings push. The whole record is read by the settings routes
+ * and by /api/v1/public/visuals, so a bloated record slows every visitor of
+ * the profile and every friend row: the caps stop abuse,
  * not real use. A default record is about 4 KB, but real ones are larger:
  * a custom stylesheet goes past 8 KB, and each saved Customize preset (up to
  * 20) carries a copy of it, so 20 presets over a 3 KB stylesheet are about
@@ -240,12 +258,95 @@ export function publicVisuals(existingData: UserData | null) {
   };
 }
 
+/**
+ * Keys publicVisuals() reads besides the look (CUSTOM_SHARE_LOOK and
+ * PUBLIC_LOOK_KEYS) and the extras (PUBLIC_EXTRAS_KEYS). A test runs
+ * publicVisuals() over a Proxy and fails on any key read that is not in
+ * PUBLIC_VISUAL_KEYS: one missing here would be served from D1 as its default.
+ */
+const PUBLIC_PROFILE_KEYS = [
+  "PROFILE_IMAGE_URL",
+  "PROFILE_BANNER_URL",
+  "PROFILE_BANNER_MODE",
+  "PROFILE_BANNER_COLOR",
+  "PROFILE_BACKGROUND_URL",
+  "PROFILE_BACKGROUND_MODE",
+  "PROFILE_BACKGROUND_COLOR",
+  "PROFILE_AVATAR_BG",
+  "PROFILE_DECORATION",
+  "PROFILE_BADGE_BG",
+  "LOGTIME_CALENDAR_COLOR",
+  "LOGTIME_LABELS_COLOR",
+  "LOGTIME_EMOJI",
+  "LOGTIME_EMOJI_DIVISOR",
+  "LOGTIME_RAINBOW_PALETTE",
+] as const;
+
+/** Read with num(), which turns any value into a number (Number("120")). */
+const PUBLIC_NUMBER_KEYS = new Set<string>([
+  "PROFILE_AVATAR_POSITION_X",
+  "PROFILE_AVATAR_POSITION_Y",
+  "PROFILE_AVATAR_SCALE",
+]);
+
+/** Every settings key publicVisuals() reads: what public_visuals stores. */
+export const PUBLIC_VISUAL_KEYS: readonly string[] = [
+  "CUSTOM_SHARE_LOOK",
+  ...PUBLIC_LOOK_KEYS,
+  ...PUBLIC_EXTRAS_KEYS,
+  ...PUBLIC_PROFILE_KEYS,
+  ...PUBLIC_NUMBER_KEYS,
+];
+
+/** The longest string any public field accepts (URLs, look strings). */
+const MAX_PUBLIC_STRING = Math.max(MAX_LOOK_STRING, MAX_VISUAL_URL, MAX_EXTRAS_STRING);
+
+/**
+ * The part of `settings` that publicVisuals() uses, as the public_visuals
+ * row keeps it (src/public-visuals.ts). publicVisuals() of the subset is the
+ * same JSON, byte for byte, as publicVisuals() of the whole settings (a test
+ * checks it over ill-typed and oversize values): a value is only left out
+ * when every reader of its key would drop it anyway (a string longer than
+ * any field accepts, an object outside OBJECT_KEYS, an array, null), and a
+ * num() key keeps the number num() makes of it. That bounds a row to a few
+ * KB whatever the record holds, and the copy is the same whether a visitor
+ * is served from D1 or from KV.
+ */
+export function publicSubset(settings: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of PUBLIC_VISUAL_KEYS) {
+    const v = settings[key];
+    if (PUBLIC_NUMBER_KEYS.has(key)) {
+      const n = typeof v === "number" ? v : Number(v ?? NaN);
+      if (Number.isFinite(n)) out[key] = n;
+    } else if (typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))) {
+      out[key] = v;
+    } else if (typeof v === "string" && v.length <= MAX_PUBLIC_STRING) {
+      out[key] = v;
+    } else if (
+      OBJECT_KEYS.has(key) &&
+      v &&
+      typeof v === "object" &&
+      !Array.isArray(v) &&
+      JSON.stringify(v).length <= MAX_LOOK_STRING
+    ) {
+      out[key] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * GET /api/v1/public/visuals?login=<hash>. `source` is what to render: the
+ * router passes the login's public_visuals row, falling back to its KV
+ * record (see publicRecord); tests may pass a record.
+ */
 export async function handlePublicVisuals(
   request: Request,
-  existingData: UserData | null,
+  source: RecordSource,
 ): Promise<Response> {
-  if (request.method !== "GET") return textRes("Method not allowed", 405);
-  return jsonRes(publicVisuals(existingData), 200, VISUALS_CACHE);
+  if (request.method !== "GET") return methodNotAllowedRes();
+  return jsonRes(publicVisuals(await recordLoader(source)()), 200, VISUALS_CACHE);
 }
 
 /**
@@ -263,35 +364,41 @@ export function parseVisualsLogins(raw: string): string[] | null {
 /**
  * GET /api/v1/public/visuals?logins=h1,h2,... -> { visuals: { h1: {...} } }
  *
- * One invocation for the whole friends list instead of one per friend. KV
- * bills one read per key either way, missing keys included: one call costs
- * up to 50 reads, so the route is limited per IP ("visuals" bucket, see
- * src/rate-limit.ts) before the bulk read. An unknown hash gets the same
- * defaults as the single form, so the batch says nothing about who has an
- * account.
+ * One invocation for the whole friends list instead of one per friend. One
+ * D1 query for the logins that have a public_visuals row, then one bulk KV
+ * read for the others only. KV bills one read per key, missing keys
+ * included, so a call can still cost up to 50 reads (made-up hashes have no
+ * row): the route is limited per IP ("visuals" bucket, see
+ * src/rate-limit.ts) before any read. An unknown hash gets the same defaults
+ * as the single form, so the batch says nothing about who has an account.
  */
 export async function handlePublicVisualsBatch(
   request: Request,
   env: Env,
   raw: string,
 ): Promise<Response> {
-  if (request.method !== "GET") return textRes("Method not allowed", 405);
+  if (request.method !== "GET") return methodNotAllowedRes();
   const hashes = parseVisualsLogins(raw);
   if (!hashes) {
-    return textRes(
+    return errorRes(
+      "bad_request",
       `logins must be 1 to ${MAX_VISUALS_LOGINS} login hashes`,
       400,
     );
   }
-  if (await rateLimited(env, "visuals", request.headers.get("CF-Connecting-IP"))) {
+  if (await rateLimited(env, "visuals", clientKey(request.headers.get("CF-Connecting-IP")))) {
     return tooManyRes();
   }
-  const records = await env.BETTER_INTRA_KV.get<UserData>(hashes, {
-    type: "json",
-  });
+  const rows = await readPublicRows(env, hashes);
+  const missing = hashes.filter((h) => !rows?.has(h));
+  const records =
+    missing.length > 0
+      ? await env.BETTER_INTRA_KV.get<UserData>(missing, { type: "json" })
+      : new Map<string, UserData | null>();
   const visuals: Record<string, ReturnType<typeof publicVisuals>> = {};
   for (const hash of hashes) {
-    visuals[hash] = publicVisuals(records.get(hash) ?? null);
+    const row = rows?.get(hash);
+    visuals[hash] = publicVisuals(row ? { settings: row } : (records.get(hash) ?? null));
   }
   return jsonRes({ visuals }, 200, VISUALS_CACHE);
 }
@@ -361,107 +468,266 @@ function recordTooLargeRes(settings: Record<string, unknown>): Response {
   );
 }
 
+/**
+ * The record to store with new settings. The legacy session fields go:
+ * sessions live in D1 (src/sessions.ts), whose marker the caller's session
+ * check wrote before any write can happen, and a token must not stay in
+ * clear. Any other field is kept.
+ */
+function withSettings(
+  record: UserData | null,
+  settings: Record<string, unknown>,
+): UserData {
+  const { sessionTokens: _tokens, sessionToken: _token, ...rest } = record ?? {};
+  return { ...rest, settings };
+}
+
+/** The record's settings revision; 0 for a record from before revisions. */
+export function revOf(record: UserData | null): number {
+  const rev = record?.settingsRev;
+  return typeof rev === "number" && Number.isFinite(rev) ? rev : 0;
+}
+
+/**
+ * The push named the revision it started from and the stored one is newer:
+ * another browser wrote since this one last synced. Nothing is written; the
+ * extension offers to pull first, or to push anyway (without baseRev).
+ */
+const conflictRes = (rev: number) =>
+  errorRes(
+    "conflict",
+    "Settings changed in another browser since this one last synced",
+    409,
+    {},
+    { rev },
+  );
+
 export async function handlePrivateSettings(
   request: Request,
   env: Env,
   loginParam: string,
-  existingData: UserData | null,
+  source: RecordSource,
 ): Promise<Response> {
-  const denied = requireSession(request, existingData);
-  if (denied) return denied;
-  // requireSession guarantees both
-  const record = existingData as UserData;
-  const authHeader = getBearerToken(request) as string;
-
-  const tokensList = getTokens(record);
+  const record = recordLoader(source);
+  const session = await authenticate(request, env, loginParam, record);
+  if (!session) return unauthorizedRes();
 
   if (request.method === "GET") {
     const url = new URL(request.url);
-    // The hub's account card only needs the session count: the settings blob
-    // is what makes the record large.
+    const [data, activeSessions] = await Promise.all([
+      record(),
+      countSessions(env, loginParam),
+    ]);
+    // The hub's account card: the session count and the revision (kept in
+    // the record, so this reads it), without the settings blob.
     if (url.searchParams.get("fields") === "meta") {
-      return jsonRes({ activeSessions: tokensList.length, discordId: null });
+      return jsonRes({ activeSessions, discordId: null, rev: revOf(data) });
     }
     return jsonRes({
-      settings: record.settings || {},
-      activeSessions: tokensList.length,
+      settings: data?.settings || {},
+      activeSessions,
       discordId: null,
+      rev: revOf(data),
     });
   }
 
   if (request.method === "POST") {
-    const body = await readJsonBody<{ settings?: unknown }>(
-      request,
-      MAX_SETTINGS_BYTES,
-      bodyTooLargeRes,
-    );
-    if (!body.ok) return body.response;
-
-    const incoming = body.value?.settings;
-    if (typeof incoming !== "object" || incoming === null || Array.isArray(incoming)) {
-      return textRes("Invalid settings payload", 400);
-    }
-    const tooLong = checkSettingValues(incoming as Record<string, unknown>);
-    if (tooLong) return tooLong;
-
-    const settingsToSave = {
-      ...(record.settings || {}),
-      ...(incoming as Record<string, unknown>),
-    };
-    const serialized = JSON.stringify(settingsToSave);
-
-    // The namespace shares 1,000 KV writes a day, and past the limit every
-    // put throws until midnight UTC (sign-ins included). A push that changes
-    // nothing (hub reload with auto-push, Push with no edit, a control set to
-    // its current value) must not spend one, nor count against the limiter.
-    if (serialized === JSON.stringify(record.settings || {})) {
-      return textRes("Saved");
-    }
-    // The merged record is what gets stored: an existing large record must
-    // not be topped up past the cap one small push at a time.
-    if (serialized.length > MAX_SETTINGS_BYTES) return recordTooLargeRes(settingsToSave);
-
-    if (await rateLimited(env, "write", loginParam)) return tooManyRes();
-
-    await env.BETTER_INTRA_KV.put(
-      loginParam,
-      JSON.stringify({ sessionTokens: tokensList, settings: settingsToSave }),
-    );
-    return textRes("Saved");
+    return pushSettings(request, env, loginParam, record);
   }
 
   if (request.method === "DELETE") {
     const url = new URL(request.url);
     if (url.searchParams.get("all") === "true") {
       if (await rateLimited(env, "write", loginParam)) return tooManyRes();
-      // Calendar first, then the D1 rows, then the record: if a step fails
-      // the user record, and so the session needed to retry, is still there.
-      await deleteCalendarData(env, loginParam, record.settings);
+      // Calendar first, then the D1 rows, the images and the record, and the
+      // sessions last: if a step fails, the session needed to retry is still
+      // there.
+      await deleteCalendarData(env, loginParam);
       // The users row (login hash, first sign-in date) feeds the public
-      // stats; "Wipe all data" must take the student out of them too.
-      await env.better_intra_d1
-        .prepare("DELETE FROM users WHERE hash = ?")
-        .bind(loginParam)
-        .run();
+      // stats; "Wipe all data" must take the student out of them too. The
+      // public copy of the settings goes with them, before the record, so
+      // visitors never see a wiped look. The day's kv_write_budget rows
+      // stay (two days at most): wiping must not reset the daily cap.
+      await env.better_intra_d1.batch([
+        env.better_intra_d1.prepare("DELETE FROM users WHERE hash = ?").bind(loginParam),
+        deletePublicRowStatement(env, loginParam),
+      ]);
       // Uploaded images: after the D1 steps, which are the ones that can
       // fail, so a retry finds nothing half-deleted.
       await deleteUserImages(env, loginParam);
       await env.BETTER_INTRA_KV.delete(loginParam);
+      await deleteAllSessions(env, loginParam);
       return textRes("All cloud data deleted");
     }
     // Signing out is not rate limited: it shared the 10-a-minute write bucket,
     // so after a burst of uploads the sign-out got a 429 while the extension
     // dropped its copy of the token, which then stayed valid here. It cannot
     // be looped: the token is gone after one call, and the next one is a 401.
-    await env.BETTER_INTRA_KV.put(
-      loginParam,
-      JSON.stringify({
-        sessionTokens: tokensList.filter((t) => t !== authHeader),
-        settings: record.settings || {},
-      }),
-    );
+    // One D1 delete: the KV record (settings) is not touched any more.
+    await deleteSession(env, session);
     return textRes("Session removed");
   }
 
-  return textRes("Method not allowed", 405);
+  return methodNotAllowedRes();
+}
+
+/**
+ * POST {settings, baseRev?}: merges `settings` into the record.
+ *
+ * `baseRev` is the revision the browser last pulled or pushed. Without it
+ * (builds up to 1.17.1, and pushes of a few keys) the merge is written as
+ * before and the answer stays the text "Saved". With it, a stored revision
+ * newer than baseRev is a 409 and nothing is written, even when the push
+ * would change nothing: a browser that never pulled used to overwrite every
+ * key another one had pushed, the friends list and the public avatar
+ * included. A stored revision older than baseRev is this browser's own last
+ * write read back stale by this location (KV may serve a copy up to 60 s
+ * old), not a conflict. Success is JSON {"ok":true,"rev":n}: the new
+ * revision, or the stored one when nothing changed (never newer than
+ * baseRev then, so it never hides another browser's write).
+ */
+async function pushSettings(
+  request: Request,
+  env: Env,
+  loginParam: string,
+  record: () => Promise<UserData | null>,
+): Promise<Response> {
+  const body = await readJsonBody<{ settings?: unknown; baseRev?: unknown } | null>(
+    request,
+    MAX_SETTINGS_BYTES,
+    bodyTooLargeRes,
+  );
+  if (!body.ok) return body.response;
+
+  const incoming = body.value?.settings;
+  if (typeof incoming !== "object" || incoming === null || Array.isArray(incoming)) {
+    return errorRes("bad_request", "Invalid settings payload", 400);
+  }
+  const rawBase = body.value?.baseRev;
+  let baseRev: number | null = null;
+  if (rawBase !== undefined && rawBase !== null) {
+    if (typeof rawBase !== "number" || !Number.isFinite(rawBase)) {
+      return errorRes("bad_request", "baseRev must be a number", 400);
+    }
+    baseRev = rawBase;
+  }
+  const tooLong = checkSettingValues(incoming as Record<string, unknown>);
+  if (tooLong) return tooLong;
+
+  const saved = (rev: number) =>
+    baseRev === null ? textRes("Saved") : jsonRes({ ok: true, rev });
+  // Spent once per push, not per attempt: a KV refusal wrote nothing.
+  let counted = false;
+  // The public subset this request stored in D1, if it did.
+  let publicWritten: string | null = null;
+  // The public subset of the record the last attempt read: what stays
+  // stored when no attempt manages to write.
+  let lastStoredPublic: string | null = null;
+  // A retry that ends without writing (the record changed in between): the
+  // public row this request wrote must match the record that stays.
+  const syncPublicRow = async (storedPublic: string) => {
+    if (publicWritten !== null && publicWritten !== storedPublic) {
+      await writePublicRow(env, loginParam, storedPublic);
+    }
+  };
+  // The put failed after the row was written (KV refused the key twice, or
+  // threw its daily limit): visitors would be served a look the record never
+  // stored, and for good if the student then went back to the stored one,
+  // since that push changes nothing public next to the record. Best effort:
+  // the push's own failure is what the client must see.
+  const unwindPublicRow = async () => {
+    if (lastStoredPublic === null) return;
+    try {
+      await syncPublicRow(lastStoredPublic);
+    } catch (e) {
+      console.warn(`[settings] public row not put back after a failed write: ${e}`);
+    }
+  };
+
+  let outcome: Response | typeof KV_BUSY;
+  try {
+    outcome = await retryKvBusy(async (again) => {
+      // The retry reads the record afresh: a push that landed in between is
+      // merged, never rolled back by a re-put of the first read.
+      const data = again
+        ? await env.BETTER_INTRA_KV.get<UserData>(loginParam, { type: "json" })
+        : await record();
+      const stored = data?.settings || {};
+      const storedRev = revOf(data);
+      const settingsToSave = {
+        ...stored,
+        ...(incoming as Record<string, unknown>),
+      };
+      const serialized = JSON.stringify(settingsToSave);
+      const storedPublic = JSON.stringify(publicSubset(stored));
+      lastStoredPublic = storedPublic;
+
+      // First, and before the limiter: a refused push must not use up a write
+      // slot. Before the no-op check too: a push of a few keys that happen to
+      // match would otherwise be answered the other browser's revision, which
+      // its sender cannot tell from its own write; adopting it, its next full
+      // push would overwrite what that browser pushed.
+      if (baseRev !== null && storedRev > baseRev) {
+        await syncPublicRow(storedPublic);
+        return conflictRes(storedRev);
+      }
+      // The namespace shares 1,000 KV writes a day, and past the limit every
+      // put throws until midnight UTC. A push that changes nothing (hub reload
+      // with auto-push, Push with no edit, a control set to its current value)
+      // must not spend one, nor count against the limiter. A record that still
+      // lists legacy tokens keeps them until a push really writes: they are
+      // dead since the copy to D1, and removing them alone would cost a write.
+      if (serialized === JSON.stringify(stored)) {
+        await syncPublicRow(storedPublic);
+        return saved(storedRev);
+      }
+      // The merged record is what gets stored: an existing large record must
+      // not be topped up past the cap one small push at a time.
+      if (serialized.length > MAX_SETTINGS_BYTES) {
+        await syncPublicRow(storedPublic);
+        return recordTooLargeRes(settingsToSave);
+      }
+
+      if (!counted) {
+        if (await rateLimited(env, "write", loginParam)) return tooManyRes();
+        if (!(await spendKvWrite(env, loginParam))) return budgetRes();
+        counted = true;
+      }
+
+      // The public copy first, and only when what visitors see changes (most
+      // pushes do not): if D1 fails nothing is written and a retry redoes both;
+      // if KV fails afterwards, the retry finds the old record and writes both
+      // again, and a put that fails for good puts the row back
+      // (unwindPublicRow). Written after the put, a failure would leave the
+      // row stale behind the no-op return above.
+      const nextPublic = JSON.stringify(publicSubset(settingsToSave));
+      if (
+        nextPublic !== storedPublic ||
+        (publicWritten !== null && publicWritten !== nextPublic)
+      ) {
+        await writePublicRow(env, loginParam, nextPublic);
+        publicWritten = nextPublic;
+      } else if (await refreshPublicRow(env, loginParam, nextPublic)) {
+        // the row was not what the record read says: see refreshPublicRow
+        publicWritten = nextPublic;
+      }
+
+      // Settings only: the push no longer carries the session list it read,
+      // which could drop a session opened since, or revive a removed one.
+      const rev = Math.max(Date.now(), storedRev + 1);
+      await env.BETTER_INTRA_KV.put(
+        loginParam,
+        JSON.stringify({ ...withSettings(data, settingsToSave), settingsRev: rev }),
+      );
+      return saved(rev);
+    });
+  } catch (e) {
+    await unwindPublicRow();
+    throw e;
+  }
+  if (outcome === KV_BUSY) {
+    await unwindPublicRow();
+    return kvBusyRes();
+  }
+  return outcome;
 }

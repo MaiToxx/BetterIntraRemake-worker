@@ -1,3 +1,9 @@
+-- The whole schema of a fresh database, in one file. migrations/ is the
+-- source of truth (`npx wrangler d1 migrations apply better-intra-d1`): this
+-- file is what all of them add up to, and tests/migrations.test.ts fails
+-- when the two differ. Everything is IF NOT EXISTS: running this file on a
+-- database that already has these tables changes nothing.
+
 -- One row per student who ever signed in (src/handlers/intra-auth.ts):
 -- the login hash and the date of the first sign-in. Read only by
 -- /api/v1/public/stats (community counter in the hub About tab) and deleted
@@ -13,9 +19,8 @@ CREATE TABLE IF NOT EXISTS users (
   created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
--- Project names shown by the subject tracker. Filled by the 42 API on
--- deployments that had an application; read-only here (an empty table only
--- leaves `name` null in the tracker's answers).
+-- Project names, filled by the 42 API on deployments that had an
+-- application. No longer read: the subject tracker answers `name: null`.
 CREATE TABLE IF NOT EXISTS projects (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
@@ -49,3 +54,38 @@ CREATE TABLE IF NOT EXISTS calendar_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS calendar_tokens_login ON calendar_tokens (login_hash);
+
+-- Sessions of the Intra sign-in (src/sessions.ts, migrations/0002): the
+-- SHA-256 of each token, never the token; created_at in milliseconds. At
+-- most 10 per login, refused once older than 365 days.
+CREATE TABLE IF NOT EXISTS sessions (
+  login_hash TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (login_hash, token_hash)
+) WITHOUT ROWID;
+
+-- Logins whose sessions have been copied out of their KV record.
+CREATE TABLE IF NOT EXISTS session_migrations (
+  login_hash TEXT PRIMARY KEY,
+  migrated_at INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- Daily KV write budget (src/budget.ts, migrations/0003): writes per UTC day
+-- (days since the epoch) per login hash, and for the whole namespace ('*').
+-- Kept two days.
+CREATE TABLE IF NOT EXISTS kv_write_budget (
+  day INTEGER NOT NULL,
+  login_hash TEXT NOT NULL,
+  n INTEGER NOT NULL,
+  PRIMARY KEY (day, login_hash)
+) WITHOUT ROWID;
+
+-- The public subset of each login's settings (src/public-visuals.ts,
+-- migrations/0004), read by /api/v1/public/visuals before the KV record.
+-- updated_at in milliseconds.
+CREATE TABLE IF NOT EXISTS public_visuals (
+  hash TEXT PRIMARY KEY,
+  settings TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);

@@ -1,8 +1,9 @@
 /**
  * In-memory stand-ins for the worker's bindings.
  *
- * FakeD1 runs the SQL on a real SQLite (node:sqlite), with schema.sql applied,
- * so constraints, JOINs and batches behave like D1 instead of like a mock that
+ * FakeD1 runs the SQL on a real SQLite (node:sqlite), built by applying
+ * migrations/*.sql in order like `wrangler d1 migrations apply` does, so
+ * constraints, JOINs and batches behave like D1 instead of like a mock that
  * pattern-matches the queries. FakeKV counts writes and deletes, the budget
  * the free plan caps at 1,000 a day.
  */
@@ -23,14 +24,34 @@ const nodeProcess = (globalThis as any).process;
 const { DatabaseSync } = nodeProcess.getBuiltinModule("node:sqlite") as {
   DatabaseSync: new (path: string) => SqliteDatabase;
 };
-const { readFileSync } = nodeProcess.getBuiltinModule("node:fs") as {
-  readFileSync(path: URL, encoding: "utf8"): string;
+const { readFileSync, readdirSync } = nodeProcess.getBuiltinModule("node:fs") as {
+  readFileSync(path: string, encoding: "utf8"): string;
+  readdirSync(path: string): string[];
+};
+const { createHash } = nodeProcess.getBuiltinModule("node:crypto") as {
+  createHash(alg: "sha256"): { update(s: string): { digest(enc: "hex"): string } };
+};
+const { fileURLToPath } = nodeProcess.getBuiltinModule("node:url") as {
+  fileURLToPath(url: string): string;
+};
+const { dirname, join } = nodeProcess.getBuiltinModule("node:path") as {
+  dirname(path: string): string;
+  join(...paths: string[]): string;
 };
 
-const SCHEMA = readFileSync(
-  new URL("../../schema.sql", (import.meta as { url?: string }).url),
-  "utf8",
+// A path, not new URL(..., import.meta.url): the extension's contract test
+// (tests/worker-contract.test.ts there) loads this file under jsdom, whose
+// URL class does not resolve file: URLs.
+const MIGRATIONS_DIR = join(
+  dirname(fileURLToPath((import.meta as { url: string }).url)),
+  "../../migrations",
 );
+
+/** migrations/*.sql, in the order wrangler applies them (by name). */
+export const MIGRATIONS: { name: string; sql: string }[] = readdirSync(MIGRATIONS_DIR)
+  .filter((name) => name.endsWith(".sql"))
+  .sort()
+  .map((name) => ({ name, sql: readFileSync(join(MIGRATIONS_DIR, name), "utf8") }));
 
 class FakeStatement {
   constructor(
@@ -58,6 +79,16 @@ class FakeStatement {
     const r = this.db.prepare(this.sql).run(...this.params);
     return { success: true, meta: { changes: Number(r.changes) } };
   }
+
+  /** What D1's batch() answers for one statement: its rows and its changes. */
+  result(): { success: true; results: Record<string, unknown>[]; meta: { changes: number } } {
+    const stmt = this.db.prepare(this.sql);
+    if (/^\s*SELECT\b/i.test(this.sql)) {
+      return { success: true, results: stmt.all(...this.params).map((r) => ({ ...r })), meta: { changes: 0 } };
+    }
+    const r = stmt.run(...this.params);
+    return { success: true, results: [], meta: { changes: Number(r.changes) } };
+  }
 }
 
 export class FakeD1 {
@@ -67,7 +98,9 @@ export class FakeD1 {
 
   constructor(opts: { schema?: boolean } = {}) {
     this.raw = new DatabaseSync(":memory:");
-    if (opts.schema !== false) this.raw.exec(SCHEMA);
+    if (opts.schema !== false) {
+      for (const m of MIGRATIONS) this.raw.exec(m.sql);
+    }
   }
 
   prepare(sql: string): FakeStatement {
@@ -80,7 +113,7 @@ export class FakeD1 {
     this.raw.exec("BEGIN");
     try {
       const out = [];
-      for (const s of stmts) out.push(await s.run());
+      for (const s of stmts) out.push(s.result());
       this.raw.exec("COMMIT");
       return out;
     } catch (e) {
@@ -98,6 +131,39 @@ export class FakeD1 {
   }
 }
 
+/** What KV throws for a second write to one key within a second. */
+export const kvRateLimitError = () => new Error("KV PUT failed: 429 Too Many Requests");
+
+/** The login's daily KV write count (src/budget.ts), 0 without a row. */
+export function budgetCount(d1: FakeD1, login: string, day?: number): number {
+  const d = day ?? Math.floor(Date.now() / 86_400_000);
+  const row = d1.rows("SELECT n FROM kv_write_budget WHERE day = ? AND login_hash = ?", d, login)[0];
+  return Number(row?.n ?? 0);
+}
+
+/** SHA-256 hex of a session token, as the sessions table keys it. */
+export function tokenHash(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+/**
+ * A signed-in session straight in D1, like a sign-in makes it: the login is
+ * marked migrated, so the KV record's legacy token list is not read.
+ */
+export function addSession(
+  d1: FakeD1,
+  login: string,
+  token: string,
+  createdAt = Date.now(),
+): void {
+  d1.raw
+    .prepare("INSERT OR IGNORE INTO session_migrations (login_hash, migrated_at) VALUES (?, ?)")
+    .run(login, createdAt);
+  d1.raw
+    .prepare("INSERT INTO sessions (login_hash, token_hash, created_at) VALUES (?, ?, ?)")
+    .run(login, tokenHash(token), createdAt);
+}
+
 export class FakeKV {
   readonly data = new Map<string, string | ArrayBuffer>();
   readonly meta = new Map<string, unknown>();
@@ -105,6 +171,10 @@ export class FakeKV {
   readonly deletes: string[] = [];
   /** When set, put() throws this (the daily limit, an outage). */
   putError: Error | null = null;
+  /** Thrown by the next put() calls, one each, before putError is looked at. */
+  readonly putErrors: Error[] = [];
+  /** Every put() call, refused ones included. */
+  putAttempts = 0;
 
   constructor(seed: Record<string, unknown> = {}) {
     for (const [k, v] of Object.entries(seed)) {
@@ -121,6 +191,7 @@ export class FakeKV {
       const raw = this.data.get(k);
       if (raw === undefined) return null;
       if (type === "arrayBuffer") return typeof raw === "string" ? new TextEncoder().encode(raw).buffer : raw;
+      if (type === "stream") return new Response(raw).body;
       if (typeof raw !== "string") return null;
       return type === "json" ? JSON.parse(raw) : raw;
     };
@@ -134,6 +205,9 @@ export class FakeKV {
     value: string | ArrayBuffer | ArrayBufferView,
     opts?: { metadata?: unknown },
   ): Promise<void> {
+    this.putAttempts++;
+    const once = this.putErrors.shift();
+    if (once) throw once;
     if (this.putError) throw this.putError;
     this.puts.push(key);
     const stored = ArrayBuffer.isView(value)
@@ -175,6 +249,42 @@ export class FakeRateLimit {
     if (this.denyAll) return { success: false };
     return { success: this.calls.filter((k) => k === key).length <= this.max };
   }
+}
+
+/**
+ * A fetch() mock for a host that accepts the connection and never answers:
+ * it only settles when the request's signal aborts, rejecting with the
+ * signal's reason (a TimeoutError for AbortSignal.timeout), like a real
+ * fetch. Without a signal it never settles, so a missing deadline shows as a
+ * test that times out. Records each URL in `calls`.
+ */
+export function hangingFetch(calls: string[] = []) {
+  return (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    calls.push(typeof input === "string" ? input : input.toString());
+    return new Promise<Response>((_, reject) => {
+      const signal = init?.signal;
+      signal?.addEventListener("abort", () => reject(signal.reason), { once: true });
+    });
+  };
+}
+
+/**
+ * A 200 whose body sends `head` and then stalls until the request's signal
+ * aborts, when it errors like a real fetch body does.
+ */
+export function stalledBody(
+  init: RequestInit | undefined,
+  head = "partial",
+  headers: Record<string, string> = {},
+): Response {
+  const signal = init?.signal;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(head));
+      signal?.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+    },
+  });
+  return new Response(stream, { status: 200, headers });
 }
 
 export function makeEnv(

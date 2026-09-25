@@ -1,6 +1,18 @@
-import { Env, UserData } from "../types";
+import { Env } from "../types";
+import { budgetRes, spendKvWrite } from "../budget";
 import { rateLimited, tooManyRes } from "../rate-limit";
-import { corsHeaders, jsonRes, readBodyCapped, requireSession, textRes } from "../utils";
+import { recordLoader, requireSession, type RecordSource } from "../sessions";
+import {
+  corsHeaders,
+  errorRes,
+  jsonRes,
+  KV_BUSY,
+  kvBusyRes,
+  methodNotAllowedRes,
+  notFoundRes,
+  readBodyCapped,
+  retryKvBusy,
+} from "../utils";
 import { sniffImageType, stripImageMetadata } from "../image-strip";
 
 export { sniffImageType };
@@ -53,16 +65,16 @@ export async function handleImageUpload(
   request: Request,
   env: Env,
   loginParam: string,
-  existingData: UserData | null,
+  source: RecordSource,
 ): Promise<Response> {
   if (request.method !== "POST" && request.method !== "DELETE") {
-    return textRes("Method not allowed", 405);
+    return methodNotAllowedRes();
   }
-  const denied = requireSession(request, existingData);
+  const denied = await requireSession(request, env, loginParam, recordLoader(source));
   if (denied) return denied;
 
   const slot = new URL(request.url).searchParams.get("slot");
-  if (!isImageSlot(slot)) return textRes("Unknown image slot", 400);
+  if (!isImageSlot(slot)) return errorRes("bad_request", "Unknown image slot", 400);
   if (await rateLimited(env, "write", loginParam)) return tooManyRes();
 
   if (request.method === "DELETE") {
@@ -73,17 +85,35 @@ export async function handleImageUpload(
   }
 
   const bytes = await readBodyCapped(request, MAX_IMAGE_BYTES);
-  if (bytes === null) return textRes("Image too large (2 MB at most)", 413);
+  if (bytes === null) return errorRes("image_too_large", "Image too large (2 MB at most)", 413);
   const type = sniffImageType(bytes);
-  if (!type) return textRes("Not a PNG, JPEG, GIF or WebP image", 415);
-  // Never the raw bytes: a file that cannot be cleaned is not stored.
+  if (!type) return errorRes("unsupported_image_type", "Not a PNG, JPEG, GIF or WebP image", 415);
+  // Never the raw bytes: a file that cannot be cleaned is not stored. Same
+  // code as a wrong type: the student does the same thing (save the image
+  // again, or pick another one).
   const clean = stripImageMetadata(bytes, type);
-  if (!clean) return textRes("Could not read this image: save it again, or use another one", 415);
+  if (!clean) {
+    return errorRes(
+      "unsupported_image_type",
+      "Could not read this image: save it again, or use another one",
+      415,
+    );
+  }
 
-  const v = Date.now();
-  await env.BETTER_INTRA_KV.put(imageKey(loginParam, slot), clean, {
-    metadata: { type, v } satisfies ImageMeta,
+  // Counted once the image is known to be stored: a refused file spends
+  // nothing out of the day's writes (see src/budget.ts).
+  if (!(await spendKvWrite(env, loginParam))) return budgetRes();
+  // Re-putting the same bytes on the retry is safe: the slot holds one
+  // image and the last upload wins either way. `v` is taken per attempt,
+  // so it still names the write that stored the bytes.
+  const v = await retryKvBusy(async () => {
+    const version = Date.now();
+    await env.BETTER_INTRA_KV.put(imageKey(loginParam, slot), clean, {
+      metadata: { type, v: version } satisfies ImageMeta,
+    });
+    return version;
   });
+  if (v === KV_BUSY) return kvBusyRes();
   const origin = new URL(request.url).origin;
   return jsonRes({ url: `${origin}${imagePath(loginParam, slot, v)}` });
 }
@@ -99,12 +129,12 @@ export async function handleImageServe(
   v: string | null,
   origin: string,
 ): Promise<Response> {
-  if (!isImageSlot(slot)) return textRes("Not found", 404);
+  if (!isImageSlot(slot)) return notFoundRes();
   const { value, metadata } = await env.BETTER_INTRA_KV.getWithMetadata<ImageMeta>(
     imageKey(loginHash, slot),
     { type: "arrayBuffer" },
   );
-  if (!value || !metadata?.type) return textRes("Not found", 404);
+  if (!value || !metadata?.type) return notFoundRes();
   const current = typeof metadata.v === "number" ? metadata.v : null;
   if (current !== null && v !== String(current)) {
     return new Response(null, {

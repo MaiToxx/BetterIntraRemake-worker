@@ -1,13 +1,14 @@
-import { Env, UserData } from "../types";
+import { Env } from "../types";
 import {
+  FETCH_DEADLINES,
   fetchAllowed,
   jsonRes,
+  methodNotAllowedRes,
   readBodyCapped,
   readJsonBody,
-  requireSession,
-  textRes,
 } from "../utils";
 import { rateLimited, tooManyRes } from "../rate-limit";
+import { recordLoader, requireSession, type RecordSource } from "../sessions";
 
 /**
  * Hosts a subject link can be on. tracker.ts reports the `href` of the first
@@ -28,7 +29,12 @@ const SLUG_RE = /^[a-z0-9][a-z0-9._-]{0,99}$/i;
 const MAX_REPORT_ITEMS = 1;
 /** A report is a slug and a URL: a few hundred bytes. */
 const MAX_REPORT_BYTES = 4 * 1024;
-const MAX_STATE_SLUGS = 20;
+/**
+ * Every extension build asks for one slug (tracker.ts); a few leave room, and
+ * all of them are read with one query. It took 20, at two sequential queries
+ * each, on a route with no rate limit.
+ */
+const MAX_STATE_SLUGS = 5;
 
 /**
  * Subject PDFs weigh a few MB. The dates sit in the Info dictionary, usually
@@ -81,20 +87,39 @@ function parsePdfDate(raw: string): number | null {
   if (offset) {
     const sign = offset[1] === "-" ? -1 : 1;
     const oh = parseInt(offset[2], 10);
-    const om = parseInt(offset[3], 10);
-    ms -= sign * (oh * 3600 + om * 60) * 1000;
+    // The minutes are optional (ISO 32000 allows `D:...+02'`): parsing the
+    // missing group gave NaN, and the whole date was stored as null.
+    const om = offset[3] ? parseInt(offset[3], 10) : 0;
+    // An offset no clock has is left out rather than trusted.
+    if (oh <= 23 && om <= 59) ms -= sign * (oh * 3600 + om * 60) * 1000;
   }
   return Number.isNaN(ms) ? null : ms;
 }
 
-async function fetchPdfMetadata(
-  url: string,
-): Promise<{ createdAt: number | null; modifiedAt: number | null } | null> {
+interface PdfMeta {
+  createdAt: number | null;
+  modifiedAt: number | null;
+}
+
+/**
+ * The download ran out of time (FETCH_DEADLINES.subjectPdfMs): unlike the
+ * other failures, not a fact about the PDF.
+ */
+const PDF_TIMED_OUT = "timed_out";
+
+/**
+ * The PDF's dates, null when it cannot be read (an error status, a redirect
+ * off the subject hosts, over 16 MB, a network error), or PDF_TIMED_OUT.
+ */
+async function fetchPdfMetadata(url: string): Promise<PdfMeta | null | typeof PDF_TIMED_OUT> {
   try {
-    const res = await fetchAllowed(new URL(url), isAllowedSubjectUrl, {
+    const res = await fetchAllowed(new URL(url), isAllowedSubjectUrl, FETCH_DEADLINES.subjectPdfMs, {
       headers: { "User-Agent": "better-intra-subject-tracker" },
     });
-    if (!res || !res.ok) return null;
+    if (!res || !res.ok) {
+      await res?.body?.cancel().catch(() => {});
+      return null;
+    }
     const buf = await readBodyCapped(res, PDF_MAX_BYTES);
     if (!buf) return null;
     const text = new TextDecoder("iso-8859-1").decode(buf);
@@ -104,8 +129,9 @@ async function fetchPdfMetadata(
       createdAt: creationMatch ? parsePdfDate(creationMatch[1]) : null,
       modifiedAt: modifiedMatch ? parsePdfDate(modifiedMatch[1]) : null,
     };
-  } catch {
-    return null;
+  } catch (e) {
+    // A DOMException, which is not an Error in every runtime
+    return (e as { name?: unknown } | null)?.name === "TimeoutError" ? PDF_TIMED_OUT : null;
   }
 }
 
@@ -128,14 +154,26 @@ async function loadSubject(env: Env, slug: string): Promise<SubjectRow | null> {
   );
 }
 
-async function loadProjectName(env: Env, slug: string): Promise<string | null> {
-  const row = await env.better_intra_d1
-    .prepare("SELECT name FROM projects WHERE slug = ?")
-    .bind(slug)
-    .first<{ name: string }>();
-  return row?.name ?? null;
+/** The rows of `slugs` (at most MAX_STATE_SLUGS), in one query. */
+async function loadSubjects(
+  env: Env,
+  slugs: string[],
+): Promise<Map<string, SubjectRow>> {
+  if (slugs.length === 0) return new Map();
+  const { results } = await env.better_intra_d1
+    .prepare(
+      `SELECT slug, url, subject_id, created_at, modified_at, last_changed_at FROM subjects WHERE slug IN (${slugs.map(() => "?").join(", ")})`,
+    )
+    .bind(...slugs)
+    .all<SubjectRow & { slug: string }>();
+  return new Map(results.map((row) => [row.slug, row]));
 }
 
+/**
+ * Seeds the slug, unless a concurrent first report seeded it since this one
+ * found no row (the PDF download in between takes seconds): false then. A
+ * plain INSERT threw on the primary key and that reporter got a 500.
+ */
 async function insertSubject(
   env: Env,
   slug: string,
@@ -143,13 +181,30 @@ async function insertSubject(
   subjectId: string | null,
   createdAt: number | null,
   modifiedAt: number | null,
-): Promise<void> {
-  await env.better_intra_d1
+): Promise<boolean> {
+  const { meta } = await env.better_intra_d1
     .prepare(
-      "INSERT INTO subjects (slug, url, subject_id, created_at, modified_at, last_changed_at) VALUES (?, ?, ?, ?, ?, NULL)",
+      "INSERT INTO subjects (slug, url, subject_id, created_at, modified_at, last_changed_at) VALUES (?, ?, ?, ?, ?, NULL) ON CONFLICT(slug) DO NOTHING",
     )
     .bind(slug, url, subjectId, createdAt, modifiedAt)
     .run();
+  return meta.changes > 0;
+}
+
+/** A report answered from the stored row: same link, or same subject. */
+function knownEntry(slug: string, row: SubjectRow) {
+  return {
+    slug,
+    status: "known",
+    // The project name came from the `projects` table, which only a 42
+    // application ever filled: always null on this deployment. Kept in the
+    // answer so its shape does not change.
+    name: null,
+    createdAt: row.created_at,
+    modifiedAt: row.modified_at,
+    lastChangedAt: row.last_changed_at,
+    subjectId: row.subject_id,
+  };
 }
 
 async function updateSubject(
@@ -173,11 +228,11 @@ export async function handleSubjectsReport(
   request: Request,
   env: Env,
   loginParam: string,
-  existingData: UserData | null,
+  source: RecordSource,
 ): Promise<Response> {
-  if (request.method !== "POST") return textRes("Method not allowed", 405);
+  if (request.method !== "POST") return methodNotAllowedRes();
 
-  const denied = requireSession(request, existingData);
+  const denied = await requireSession(request, env, loginParam, recordLoader(source));
   if (denied) return denied;
 
   // The only route that wrote shared data without a limit: a signed-in loop
@@ -219,13 +274,21 @@ export async function handleSubjectsReport(
     }
 
     const subjectId = parseSubjectIdFromUrl(url);
-    const name = await loadProjectName(env, slug);
 
     const current = await loadSubject(env, slug);
     if (!current) {
       // Seed: read the PDF metadata once.
       const meta = await fetchPdfMetadata(url);
-      await insertSubject(
+      if (meta === PDF_TIMED_OUT) {
+        // Not seeded: a row with null dates is never read again while the
+        // link stays, so a slow CDN would take the dates from everyone for
+        // good. The next reporter tries again (every build handles
+        // "unknown": no date, like a failed report). A PDF that cannot be
+        // read at all still seeds with null dates, so its changes are seen.
+        results.push({ slug, status: "unknown", reason: "pdf_unavailable" });
+        continue;
+      }
+      const seeded = await insertSubject(
         env,
         slug,
         url,
@@ -233,10 +296,17 @@ export async function handleSubjectsReport(
         meta?.createdAt ?? null,
         meta?.modifiedAt ?? null,
       );
+      if (!seeded) {
+        const winner = await loadSubject(env, slug);
+        if (winner) {
+          results.push(knownEntry(slug, winner));
+          continue;
+        }
+      }
       results.push({
         slug,
         status: "first",
-        name,
+        name: null,
         createdAt: meta?.createdAt ?? null,
         modifiedAt: meta?.modifiedAt ?? null,
         lastChangedAt: null,
@@ -253,20 +323,16 @@ export async function handleSubjectsReport(
     const sameSubject =
       !!subjectId && !!current.subject_id && String(current.subject_id) === subjectId;
     if (current.url === url || sameSubject) {
-      results.push({
-        slug,
-        status: "known",
-        name,
-        createdAt: current.created_at,
-        modifiedAt: current.modified_at,
-        lastChangedAt: current.last_changed_at,
-        subjectId: current.subject_id,
-      });
+      results.push(knownEntry(slug, current));
       continue;
     }
 
-    // New link → fetch the new PDF metadata and record the change.
-    const meta = await fetchPdfMetadata(url);
+    // New link → fetch the new PDF metadata and record the change. The change
+    // is recorded whatever the download gave: it is what every tracker user
+    // is told about, and a reporter answered anything but "changed" would
+    // show the previous change's date.
+    const fetched = await fetchPdfMetadata(url);
+    const meta = fetched === PDF_TIMED_OUT ? null : fetched;
     await updateSubject(
       env,
       slug,
@@ -279,7 +345,7 @@ export async function handleSubjectsReport(
     results.push({
       slug,
       status: "changed",
-      name,
+      name: null,
       createdAt: meta?.createdAt ?? null,
       modifiedAt: meta?.modifiedAt ?? null,
       lastChangedAt: now,
@@ -298,34 +364,36 @@ export async function handleSubjectsState(
   request: Request,
   env: Env,
   loginParam: string,
-  existingData: UserData | null,
+  source: RecordSource,
 ): Promise<Response> {
-  if (request.method !== "GET") return textRes("Method not allowed", 405);
+  if (request.method !== "GET") return methodNotAllowedRes();
 
-  const denied = requireSession(request, existingData);
+  const denied = await requireSession(request, env, loginParam, recordLoader(source));
   if (denied) return denied;
 
   const raw = new URL(request.url).searchParams.get("slugs") ?? "";
-  const slugs = raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(isValidSlug)
-    .slice(0, MAX_STATE_SLUGS);
+  const slugs = [
+    ...new Set(
+      raw
+        .split(",")
+        .map((s) => s.trim())
+        .filter(isValidSlug),
+    ),
+  ].slice(0, MAX_STATE_SLUGS);
 
-  const results: any[] = [];
-  for (const slug of slugs) {
-    const row = await loadSubject(env, slug);
-    const name = await loadProjectName(env, slug);
-    results.push({
+  const rows = await loadSubjects(env, slugs);
+  const results = slugs.map((slug) => {
+    const row = rows.get(slug);
+    return {
       slug,
       tracked: !!row,
-      name,
+      name: null,
       subjectId: row?.subject_id ?? null,
       createdAt: row?.created_at ?? null,
       modifiedAt: row?.modified_at ?? null,
       lastChangedAt: row?.last_changed_at ?? null,
-    });
-  }
+    };
+  });
 
   return jsonRes({ subjects: results });
 }

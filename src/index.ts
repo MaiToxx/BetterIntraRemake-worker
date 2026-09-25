@@ -11,17 +11,24 @@ import {
   handleCalendarUpdate,
   handleCalendarIcs,
 } from "./handlers/calendar";
-import { handleClusterSvg, handleClusterSvgs } from "./handlers/clusters";
+import { handleClusterSvg } from "./handlers/clusters";
 import { handleImageServe, handleImageUpload } from "./handlers/images";
 import { handleAnnouncement } from "./handlers/announcement";
 import { handleStats } from "./handlers/stats";
-import { Env, UserData } from "./types";
+import { handleSessions } from "./handlers/sessions";
+import { handleExport } from "./handlers/export";
+import { publicRecord } from "./public-visuals";
+import { kvRecord } from "./sessions";
+import { Env } from "./types";
 import {
+  errorRes,
   getBearerToken,
   isLoginHash,
   isOriginAllowed,
+  methodNotAllowedRes,
+  notFoundRes,
   serverErrorRes,
-  textRes,
+  unauthorizedRes,
 } from "./utils";
 
 /**
@@ -42,15 +49,21 @@ export default {
   },
 };
 
-/** Routes that name a user through `login=<hash>` and read their KV record. */
+/**
+ * Routes that name a user through `login=<hash>`. The private ones check the
+ * session in D1 (src/sessions.ts) and read the KV record only when they need
+ * it.
+ */
 const USER_ROUTES = new Set([
   "/api/v1/public/visuals",
   "/api/v1/private/settings",
+  "/api/v1/private/sessions",
   "/api/v1/private/subjects/report",
   "/api/v1/private/subjects/state",
   "/api/v1/private/calendar/token",
   "/api/v1/private/calendar/update",
   "/api/v1/private/images",
+  "/api/v1/private/export",
 ]);
 
 async function route(request: Request, env: Env): Promise<Response> {
@@ -58,7 +71,12 @@ async function route(request: Request, env: Env): Promise<Response> {
   const origin = request.headers.get("Origin");
 
   if (origin && !isOriginAllowed(origin)) {
-    return new Response("Origin not allowed", { status: 403 });
+    // JSON like every error, but without the CORS headers: that page must
+    // not read anything from here.
+    return new Response(
+      JSON.stringify({ error: "unauthorized", message: "Origin not allowed" }),
+      { status: 403, headers: { "Content-Type": "application/json" } },
+    );
   }
 
   if (request.method === "OPTIONS") {
@@ -91,13 +109,9 @@ async function route(request: Request, env: Env): Promise<Response> {
     return handleClusterSvg(request, env, origin);
   }
 
-  if (url.pathname === "/api/v1/cluster/svgs") {
-    return handleClusterSvgs(env, origin);
-  }
-
   const imgMatch = url.pathname.match(/^\/img\/([a-f0-9]{64})\/([a-z]+)$/);
   if (imgMatch) {
-    if (request.method !== "GET") return textRes("Method not allowed", 405);
+    if (request.method !== "GET") return methodNotAllowedRes();
     return handleImageServe(
       env,
       imgMatch[1],
@@ -127,53 +141,61 @@ async function route(request: Request, env: Env): Promise<Response> {
 
   // Unknown paths are 404 whatever the query: the login checks below are for
   // the user routes only.
-  if (!USER_ROUTES.has(url.pathname)) return textRes("Not found", 404);
+  if (!USER_ROUTES.has(url.pathname)) return notFoundRes();
 
   const loginParam = url.searchParams.get("login");
   if (!loginParam) {
-    return textRes("Username hash required", 400);
+    return errorRes("bad_request", "Username hash required", 400);
   }
   if (!isLoginHash(loginParam)) {
-    return textRes("Invalid username hash", 400);
+    return errorRes("bad_request", "Invalid username hash", 400);
   }
 
-  // Every private route needs a Bearer token: refusing here, before the KV
-  // read, means an anonymous scanner spends no read out of the daily budget.
-  // Same 401 as a wrong token or an unknown login (see requireSession).
+  // Every private route needs a Bearer token: refusing here, before any KV
+  // or D1 read, means an anonymous scanner spends nothing out of the daily
+  // budgets. Same 401 as a wrong token or an unknown login.
   if (url.pathname.startsWith("/api/v1/private/") && !getBearerToken(request)) {
-    return textRes("Unauthorized", 401);
+    return unauthorizedRes();
   }
 
-  const existingData: UserData | null = await env.BETTER_INTRA_KV.get(
-    loginParam,
-    { type: "json" },
-  );
+  // Read on first use, at most once: the routes that only need the session
+  // never read it once the login is migrated.
+  const record = kvRecord(env, loginParam);
 
   if (url.pathname === "/api/v1/public/visuals") {
-    return handlePublicVisuals(request, existingData);
+    // The public_visuals row in D1, else the KV record: see src/public-visuals.ts
+    return handlePublicVisuals(request, () => publicRecord(env, loginParam, record));
   }
 
   if (url.pathname === "/api/v1/private/settings") {
-    return handlePrivateSettings(request, env, loginParam, existingData);
+    return handlePrivateSettings(request, env, loginParam, record);
+  }
+
+  if (url.pathname === "/api/v1/private/sessions") {
+    return handleSessions(request, env, loginParam, record);
   }
 
   if (url.pathname === "/api/v1/private/subjects/report") {
-    return handleSubjectsReport(request, env, loginParam, existingData);
+    return handleSubjectsReport(request, env, loginParam, record);
   }
 
   if (url.pathname === "/api/v1/private/subjects/state") {
-    return handleSubjectsState(request, env, loginParam, existingData);
+    return handleSubjectsState(request, env, loginParam, record);
   }
 
   if (url.pathname === "/api/v1/private/images") {
     // POST uploads, DELETE removes a slot
-    return handleImageUpload(request, env, loginParam, existingData);
+    return handleImageUpload(request, env, loginParam, record);
   }
 
   if (url.pathname === "/api/v1/private/calendar/token") {
-    return handleCalendarToken(request, env, loginParam, existingData);
+    return handleCalendarToken(request, env, loginParam, record);
+  }
+
+  if (url.pathname === "/api/v1/private/export") {
+    return handleExport(request, env, loginParam, record);
   }
 
   // USER_ROUTES leaves only /api/v1/private/calendar/update here
-  return handleCalendarUpdate(request, env, loginParam, existingData);
+  return handleCalendarUpdate(request, env, loginParam, record);
 }

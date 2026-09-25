@@ -1,5 +1,5 @@
 import { Env } from "../types";
-import { jsonRes, textRes } from "../utils";
+import { jsonRes, methodNotAllowedRes } from "../utils";
 
 interface StatsBody {
   total: number;
@@ -59,7 +59,7 @@ export async function handleStats(
   env: Env,
   now: number = Date.now(),
 ): Promise<Response> {
-  if (request.method !== "GET") return textRes("Method not allowed", 405);
+  if (request.method !== "GET") return methodNotAllowedRes();
 
   if (!cached || now - cached.at >= STATS_CACHE_MS) {
     cached = { at: now, body: await readCounts(env, Math.floor(now / 1000)) };

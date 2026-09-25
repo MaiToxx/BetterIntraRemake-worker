@@ -1,10 +1,17 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import {
   hashLogin,
   getTokens,
+  sha256Hex,
   getBearerToken,
   isOriginAllowed,
   redactPath,
+  errorRes,
+  isKvRateLimited,
+  KV_BUSY,
+  KV_RETRY,
+  kvBusyRes,
+  retryKvBusy,
 } from "../src/utils";
 
 describe("hashLogin", () => {
@@ -36,6 +43,13 @@ describe("hashLogin", () => {
     const a = await hashLogin("alice");
     const b = await hashLogin("bob");
     expect(a).not.toBe(b);
+  });
+});
+
+describe("sha256Hex", () => {
+  it("is the SHA-256 of the UTF-8 text, in lowercase hex", async () => {
+    expect(await sha256Hex("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    expect(await hashLogin(" NicoPasla ")).toBe(await sha256Hex("nicopasla"));
   });
 });
 
@@ -113,5 +127,80 @@ describe("redactPath", () => {
     expect(redactPath("/calendar/8f14e45f-ceea-467a-9575-6d0f5b1c2e3a.ics")).toBe("/calendar/:token.ics");
     expect(redactPath("/img/" + "ab".repeat(32) + "/avatar")).toBe("/img/:hash/avatar");
     expect(redactPath("/api/v1/private/settings")).toBe("/api/v1/private/settings");
+  });
+});
+
+describe("errorRes", () => {
+  it("is JSON {error, message} plus extra fields, CORS-readable, never sniffed", async () => {
+    const res = errorRes("conflict", "Changed", 409, { "Retry-After": "1" }, { rev: 3 });
+    expect(res.status).toBe(409);
+    expect(res.headers.get("Content-Type")).toBe("application/json");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(res.headers.get("Retry-After")).toBe("1");
+    expect(await res.json()).toEqual({ error: "conflict", message: "Changed", rev: 3 });
+  });
+});
+
+describe("retryKvBusy", () => {
+  afterEach(() => {
+    KV_RETRY.delayMs = 1100;
+  });
+
+  it("tells KV's per-key refusal from its other errors", () => {
+    expect(isKvRateLimited(new Error("KV PUT failed: 429 Too Many Requests"))).toBe(true);
+    expect(isKvRateLimited(new Error("Too many requests"))).toBe(true);
+    expect(isKvRateLimited(new Error("KV put() limit exceeded for the day."))).toBe(false);
+    expect(isKvRateLimited(new Error("network lost"))).toBe(false);
+    expect(isKvRateLimited(new Error("id 14290 not found"))).toBe(false);
+  });
+
+  it("runs the attempt once more, marked as a retry, after a per-key refusal only", async () => {
+    KV_RETRY.delayMs = 0;
+    const seen: boolean[] = [];
+    let n = 0;
+    const out = await retryKvBusy(async (again) => {
+      seen.push(again);
+      if (n++ === 0) throw new Error("KV PUT failed: 429 Too Many Requests");
+      return "done";
+    });
+    expect(out).toBe("done");
+    expect(seen).toEqual([false, true]);
+
+    await expect(
+      retryKvBusy(async () => {
+        throw new Error("KV put() limit exceeded for the day.");
+      }),
+    ).rejects.toThrow("exceeded for the day");
+
+    const busy = await retryKvBusy(async () => {
+      throw new Error("KV PUT failed: 429 Too Many Requests");
+    });
+    expect(busy).toBe(KV_BUSY);
+  });
+
+  it("waits KV_RETRY.delayMs between the two runs", async () => {
+    vi.useFakeTimers();
+    try {
+      let runs = 0;
+      const pending = retryKvBusy(async () => {
+        runs++;
+        throw new Error("KV PUT failed: 429 Too Many Requests");
+      });
+      await vi.advanceTimersByTimeAsync(1099);
+      expect(runs).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await pending).toBe(KV_BUSY);
+      expect(runs).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("answers 503 kv_busy with Retry-After: 2 once both runs were refused", async () => {
+    const res = kvBusyRes();
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("2");
+    expect(((await res.json()) as { error: string }).error).toBe("kv_busy");
   });
 });

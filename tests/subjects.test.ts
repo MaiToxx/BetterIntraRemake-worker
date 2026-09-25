@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { resetRateLimits } from "../src/rate-limit";
 import {
   handleSubjectsReport,
@@ -6,6 +6,8 @@ import {
   normalizeSubjectUrl,
 } from "../src/handlers/subjects";
 import { Env, UserData } from "../src/types";
+import { FETCH_DEADLINES } from "../src/utils";
+import { FakeD1, hangingFetch, stalledBody } from "./helpers/fake-env";
 
 const TOKEN = "test-session-token";
 const SEED_DATE = Date.UTC(2026, 7, 11, 14, 19, 24);
@@ -19,73 +21,37 @@ interface SubjectRecord {
   lastChangedAt: number | null;
 }
 
-class MockD1 {
-  subjects = new Map<string, SubjectRecord>();
-  projectNames = new Map<string, string>();
-
-  private sql = "";
-  private bindArgs: any[] = [];
-
-  prepare(sql: string) {
-    this.sql = sql;
-    return this;
-  }
-
-  bind(...args: any[]) {
-    this.bindArgs = args;
-    return this;
-  }
-
-  async first(): Promise<any> {
-    const sql = this.sql;
-    if (sql.includes("FROM subjects WHERE slug")) {
-      const r = this.subjects.get(this.bindArgs[0]);
-      return r
-        ? {
-            url: r.url,
-            subject_id: r.subjectId,
-            created_at: r.createdAt,
-            modified_at: r.modifiedAt,
-            last_changed_at: r.lastChangedAt,
-          }
-        : null;
-    }
-    if (sql.includes("FROM projects WHERE slug")) {
-      const name = this.projectNames.get(this.bindArgs[0]);
-      return name === undefined ? null : { name };
-    }
-    return null;
-  }
-
-  async run(): Promise<any> {
-    const sql = this.sql;
-    if (sql.startsWith("INSERT INTO subjects")) {
-      const [slug, url, subjectId, createdAt, modifiedAt] = this.bindArgs;
-      this.subjects.set(slug, {
-        url,
-        subjectId,
-        createdAt,
-        modifiedAt,
-        lastChangedAt: null,
-      });
-      return {};
-    }
-    if (sql.startsWith("UPDATE subjects")) {
-      const [url, subjectId, createdAt, modifiedAt, at, slug] = this.bindArgs;
-      this.subjects.set(slug, {
-        url,
-        subjectId,
-        createdAt,
-        modifiedAt,
-        lastChangedAt: at,
-      });
-      return {};
-    }
-    return {};
-  }
+/** The stored row of `slug` (real SQLite, like D1), or undefined. */
+function subjectRow(d1: FakeD1, slug: string): SubjectRecord | undefined {
+  const r = d1.rows(
+    "SELECT url, subject_id, created_at, modified_at, last_changed_at FROM subjects WHERE slug = ?",
+    slug,
+  )[0];
+  return r
+    ? {
+        url: r.url as string,
+        subjectId: r.subject_id as string | null,
+        createdAt: r.created_at as number | null,
+        modifiedAt: r.modified_at as number | null,
+        lastChangedAt: r.last_changed_at as number | null,
+      }
+    : undefined;
 }
 
-function makeEnv(d1: MockD1): Env {
+function putSubject(d1: FakeD1, slug: string, r: SubjectRecord): void {
+  d1.raw
+    .prepare(
+      "INSERT INTO subjects (slug, url, subject_id, created_at, modified_at, last_changed_at) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run(slug, r.url, r.subjectId, r.createdAt, r.modifiedAt, r.lastChangedAt);
+}
+
+const subjectCount = (d1: FakeD1) => Number(d1.rows("SELECT COUNT(*) AS n FROM subjects")[0].n);
+
+/** Statements of the registry itself, leaving out the session checks. */
+const subjectStatements = (d1: FakeD1) => d1.prepared.filter((sql) => !/\bsession/.test(sql));
+
+function makeEnv(d1: FakeD1): Env {
   return { better_intra_d1: d1 as any, BETTER_INTRA_KV: {} as any } as Env;
 }
 
@@ -118,6 +84,11 @@ function pdfResponse(modDate: string): Response {
   return new Response(bytes, { status: 200 });
 }
 
+const DEADLINE = FETCH_DEADLINES.subjectPdfMs;
+afterEach(() => {
+  FETCH_DEADLINES.subjectPdfMs = DEADLINE;
+});
+
 function mockPdfFetch(dates: string[]) {
   const calls: string[] = [];
   (globalThis as any).fetch = vi.fn(async (url: string) => {
@@ -128,14 +99,15 @@ function mockPdfFetch(dates: string[]) {
 }
 
 describe("handleSubjectsReport", () => {
-  let d1: MockD1;
+  let d1: FakeD1;
   let env: Env;
 
   beforeEach(() => {
     // the write limiter counts per login across cases otherwise
     resetRateLimits();
-    d1 = new MockD1();
-    d1.projectNames.set("python-module-10", "Python Module 10");
+    d1 = new FakeD1();
+    // what a live database may hold: a 42-application name nothing reads
+    d1.raw.prepare("INSERT INTO projects (id, name, slug) VALUES (1, 'Python Module 10', 'python-module-10')").run();
     env = makeEnv(d1);
     vi.restoreAllMocks();
   });
@@ -200,17 +172,20 @@ describe("handleSubjectsReport", () => {
       sessionData(),
     );
     const body = (await res.json()) as { subjects: any[] };
-    expect(body.subjects[0]).toMatchObject({
+    expect(body.subjects[0]).toEqual({
       slug: "python-module-10",
       status: "first",
-      name: "Python Module 10",
+      name: null,
       createdAt: SEED_DATE,
       modifiedAt: SEED_DATE,
       lastChangedAt: null,
       subjectId: "900001",
     });
     expect(calls).toHaveLength(1);
-    expect(d1.subjects.get("python-module-10")).toEqual({
+    // the project name query is gone: the table only ever held what a 42
+    // application filled in, and nothing read the name
+    expect(d1.prepared.some((sql) => /\bprojects\b/.test(sql))).toBe(false);
+    expect(subjectRow(d1, "python-module-10")).toEqual({
       url: URL_A,
       subjectId: "900001",
       createdAt: SEED_DATE,
@@ -235,6 +210,151 @@ describe("handleSubjectsReport", () => {
     expect(body.subjects[0].status).toBe("first");
     expect(body.subjects[0].createdAt).toBeNull();
     expect(body.subjects[0].modifiedAt).toBeNull();
+    expect(subjectRow(d1, "python-module-10")?.createdAt).toBeNull();
+  });
+
+  for (const [form, date] of [
+    ["+02'00'", "D:20260811161924+02'00'"],
+    // ISO 32000 allows the minutes to be left out: read as null before
+    ["+02' (no minutes)", "D:20260811161924+02'"],
+    ["+02 (no apostrophe)", "D:20260811161924+02"],
+    ["+0200", "D:20260811161924+0200"],
+    // Quartz (macOS) writes UTC this way
+    ["Z00'00'", "D:20260811141924Z00'00'"],
+    ["-05'30'", "D:20260811084924-05'30'"],
+  ] as const) {
+    it(`reads a PDF date with the offset ${form}`, async () => {
+      mockPdfFetch([date]);
+      const res = await handleSubjectsReport(
+        post("https://x/report", { items: [{ slug: "libft", url: URL_A }] }),
+        env,
+        "hash-a",
+        sessionData(),
+      );
+      const entry = ((await res.json()) as { subjects: any[] }).subjects[0];
+      expect(entry).toMatchObject({ status: "first", createdAt: SEED_DATE, modifiedAt: SEED_DATE });
+      expect(subjectRow(d1, "libft")?.modifiedAt).toBe(SEED_DATE);
+    });
+  }
+
+  it("ignores an offset no clock has rather than shifting the date by it", async () => {
+    mockPdfFetch(["D:20260811141924+99'00'"]);
+    const res = await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: URL_A }] }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    expect(((await res.json()) as { subjects: any[] }).subjects[0].createdAt).toBe(SEED_DATE);
+  });
+
+  it("answers two concurrent first reports of one slug, one row and one 'known'", async () => {
+    // Both requests find no row, then download: the second insert used to
+    // throw on the primary key and answer 500.
+    let release!: () => void;
+    const bothFetching = new Promise<void>((resolve) => (release = resolve));
+    let fetches = 0;
+    (globalThis as any).fetch = vi.fn(async () => {
+      if (++fetches === 2) release();
+      await bothFetching;
+      return pdfResponse("D:20260811161924+02'00'");
+    });
+    const report = (login: string) =>
+      handleSubjectsReport(
+        post("https://x/report", { items: [{ slug: "minishell", url: URL_A }] }),
+        env,
+        login,
+        sessionData(),
+      );
+    const [a, b] = await Promise.all([report("hash-a"), report("hash-b")]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    const entries = [
+      ((await a.json()) as { subjects: any[] }).subjects[0],
+      ((await b.json()) as { subjects: any[] }).subjects[0],
+    ];
+    expect(entries.map((e) => e.status).sort()).toEqual(["first", "known"]);
+    expect(entries.find((e) => e.status === "known")).toEqual({
+      slug: "minishell",
+      status: "known",
+      name: null,
+      createdAt: SEED_DATE,
+      modifiedAt: SEED_DATE,
+      lastChangedAt: null,
+      subjectId: "900001",
+    });
+    expect(fetches).toBe(2);
+    expect(subjectCount(d1)).toBe(1);
+  });
+
+  it("does not seed a slug whose PDF download timed out: the next reporter does", async () => {
+    FETCH_DEADLINES.subjectPdfMs = 20;
+    const calls: string[] = [];
+    (globalThis as any).fetch = vi.fn(hangingFetch(calls));
+    const res = await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: URL_A }] }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as { subjects: any[] }).subjects).toEqual([
+      { slug: "libft", status: "unknown", reason: "pdf_unavailable" },
+    ]);
+    expect(calls).toEqual([URL_A]);
+    expect(subjectCount(d1)).toBe(0);
+
+    mockPdfFetch(["D:20260811161924+02'00'"]);
+    const next = await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: URL_A }] }),
+      env,
+      "hash-b",
+      sessionData(),
+    );
+    expect(((await next.json()) as { subjects: any[] }).subjects[0]).toMatchObject({
+      status: "first",
+      createdAt: SEED_DATE,
+    });
+    expect(subjectRow(d1, "libft")?.createdAt).toBe(SEED_DATE);
+  });
+
+  it("times out a PDF that stalls mid-body the same way, without seeding", async () => {
+    FETCH_DEADLINES.subjectPdfMs = 20;
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: RequestInit) =>
+      stalledBody(init, "%PDF-1.7 << /CreationDate (D:2026"),
+    );
+    const res = await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "libft", url: URL_A }] }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    expect(((await res.json()) as { subjects: any[] }).subjects[0]).toEqual({
+      slug: "libft",
+      status: "unknown",
+      reason: "pdf_unavailable",
+    });
+    expect(subjectCount(d1)).toBe(0);
+  });
+
+  it("still records a change whose new PDF timed out, with null dates", async () => {
+    putSubject(d1, "minishell", {
+      url: URL_A,
+      subjectId: "900001",
+      createdAt: SEED_DATE,
+      modifiedAt: SEED_DATE,
+      lastChangedAt: null,
+    });
+    FETCH_DEADLINES.subjectPdfMs = 20;
+    (globalThis as any).fetch = vi.fn(hangingFetch());
+    const res = await handleSubjectsReport(
+      post("https://x/report", { items: [{ slug: "minishell", url: URL_B }] }),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const entry = ((await res.json()) as { subjects: any[] }).subjects[0];
+    expect(entry).toMatchObject({ status: "changed", modifiedAt: null, to: { subjectId: "900002", modifiedAt: null } });
+    expect(subjectRow(d1, "minishell")).toMatchObject({ url: URL_B, subjectId: "900002", createdAt: null });
   });
 
   it("is known for an unchanged url without re-fetching the pdf", async () => {
@@ -293,7 +413,7 @@ describe("handleSubjectsReport", () => {
     });
     expect(calls).toHaveLength(2);
 
-    expect(d1.subjects.get("minishell")).toEqual({
+    expect(subjectRow(d1, "minishell")).toEqual({
       url: URL_B,
       subjectId: "900002",
       createdAt: NEW_DATE,
@@ -322,7 +442,7 @@ describe("handleSubjectsReport", () => {
       expect(body.subjects).toEqual([{ slug: "minishell", status: "unknown", reason: "invalid_url" }]);
     }
     expect(calls).toEqual([]);
-    expect(d1.subjects.size).toBe(0);
+    expect(subjectCount(d1)).toBe(0);
   });
 
   it("rejects malformed slugs before any work", async () => {
@@ -345,7 +465,7 @@ describe("handleSubjectsReport", () => {
     ]);
     expect(entries[0].slug).toHaveLength(100);
     expect(calls).toEqual([]);
-    expect(d1.subjects.size).toBe(0);
+    expect(subjectCount(d1)).toBe(0);
   });
 
   it("accepts real project slugs", async () => {
@@ -373,7 +493,7 @@ describe("handleSubjectsReport", () => {
       sessionData(),
     );
     expect(calls).toEqual([URL_A]);
-    expect(d1.subjects.get("libft")?.url).toBe(URL_A);
+    expect(subjectRow(d1, "libft")?.url).toBe(URL_A);
   });
 
   it("handles one item per request (each can be a 16 MB download)", async () => {
@@ -503,11 +623,11 @@ describe("normalizeSubjectUrl", () => {
 });
 
 describe("handleSubjectsState", () => {
-  let d1: MockD1;
+  let d1: FakeD1;
   let env: Env;
 
   beforeEach(() => {
-    d1 = new MockD1();
+    d1 = new FakeD1();
     env = makeEnv(d1);
   });
 
@@ -521,17 +641,42 @@ describe("handleSubjectsState", () => {
     expect(res.status).toBe(401);
   });
 
-  it("skips malformed slugs and caps the list", async () => {
+  it("skips malformed slugs, counts a repeated one once and caps the list at 5", async () => {
     const many = Array.from({ length: 30 }, (_, i) => `p-${i}`);
     const res = await handleSubjectsState(
-      get(`https://x/state?slugs=${encodeURIComponent(["../x", ...many].join(","))}`),
+      get(`https://x/state?slugs=${encodeURIComponent(["../x", "p-0", "p-0", ...many].join(","))}`),
       env,
       "hash-a",
       sessionData(),
     );
     const body = (await res.json()) as { subjects: any[] };
-    expect(body.subjects).toHaveLength(20);
-    expect(body.subjects[0].slug).toBe("p-0");
+    expect(body.subjects.map((s) => s.slug)).toEqual(["p-0", "p-1", "p-2", "p-3", "p-4"]);
+  });
+
+  it("reads every slug with one query, in the order asked", async () => {
+    putSubject(d1, "libft", { url: URL_A, subjectId: "900001", createdAt: SEED_DATE, modifiedAt: SEED_DATE, lastChangedAt: null });
+    putSubject(d1, "minishell", { url: URL_B, subjectId: "900002", createdAt: null, modifiedAt: NEW_DATE, lastChangedAt: 7 });
+    const res = await handleSubjectsState(
+      get("https://x/state?slugs=minishell,cub3d,libft"),
+      env,
+      "hash-a",
+      sessionData(),
+    );
+    const body = (await res.json()) as { subjects: any[] };
+    expect(body.subjects.map((s) => [s.slug, s.tracked, s.subjectId])).toEqual([
+      ["minishell", true, "900002"],
+      ["cub3d", false, null],
+      ["libft", true, "900001"],
+    ]);
+    expect(body.subjects[0]).toMatchObject({ createdAt: null, modifiedAt: NEW_DATE, lastChangedAt: 7, name: null });
+    expect(subjectStatements(d1)).toHaveLength(1);
+    expect(d1.prepared.some((sql) => /\bprojects\b/.test(sql))).toBe(false);
+  });
+
+  it("runs no registry query when no slug is valid", async () => {
+    const res = await handleSubjectsState(get("https://x/state?slugs=../x,,%20"), env, "hash-a", sessionData());
+    expect(await res.json()).toEqual({ subjects: [] });
+    expect(subjectStatements(d1)).toEqual([]);
   });
 
   it("returns tracked:false for unknown slugs", async () => {
@@ -556,7 +701,7 @@ describe("handleSubjectsState", () => {
   });
 
   it("returns the saved url and dates for tracked slugs", async () => {
-    d1.subjects.set("libft", {
+    putSubject(d1, "libft", {
       url: URL_A,
       subjectId: "900001",
       createdAt: SEED_DATE,

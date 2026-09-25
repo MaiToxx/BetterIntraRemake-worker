@@ -7,14 +7,26 @@
  * against Keycloak's public keys (JWKS), checks issuer and expiry, and opens a
  * Better Intra session for the login carried by the token, exactly like the
  * OAuth callback does, minus the 42 API tokens (features that call the 42
- * API server-side stay unavailable on such sessions).
+ * API server-side stay unavailable on such sessions). The session lives in D1
+ * (src/sessions.ts); the KV record is only written by a first sign-in.
  *
  *   POST /auth/intra   { "token": "Bearer eyJ..." }
  *   -> { "token": "<session token>", "login": "<intra login>" }
  */
 import { Env, UserData } from "../types";
-import { rateLimited, tooManyRes } from "../rate-limit";
-import { getTokens, hashLogin, jsonRes, readJsonBody, textRes } from "../utils";
+import { DAILY_KV_WRITES_SIGN_IN, spendKvWrite } from "../budget";
+import { clientKey, rateLimited, tooManyRes } from "../rate-limit";
+import { createSession } from "../sessions";
+import {
+  errorRes,
+  FETCH_DEADLINES,
+  hashLogin,
+  jsonRes,
+  KV_BUSY,
+  methodNotAllowedRes,
+  readJsonBody,
+  retryKvBusy,
+} from "../utils";
 
 export const INTRA_ISSUER = "https://auth.42.fr/auth/realms/students-42";
 const JWKS_URL = `${INTRA_ISSUER}/protocol/openid-connect/certs`;
@@ -59,6 +71,8 @@ interface JwtPayload {
   iss?: string;
   exp?: number;
   sub?: string;
+  /** Client the token was issued to ("frontend-react" for the Intra v3). */
+  azp?: unknown;
   preferred_username?: string;
   login?: string;
 }
@@ -110,6 +124,25 @@ function checkClaims(decoded: DecodedJwt, now: number): boolean {
   if (payload.iss !== INTRA_ISSUER) return false;
   if (typeof payload.exp !== "number" || payload.exp * 1000 <= now) return false;
   return true;
+}
+
+/**
+ * Whether the client a token was issued to (`azp`) may sign in. `allowed`
+ * is JWT_ALLOWED_AZP, comma-separated. Every client of the students-42 realm
+ * gets tokens signed with the same key and carrying the same login, but the
+ * extension only ever sends the Intra v3 front-end's (profile-v3, client
+ * "frontend-react", read from its public bundle): pinning it means a token
+ * leaked by, or issued to, any other client of the realm opens no session
+ * here. Empty or missing turns the check off, so a 42 rename that refuses
+ * every sign-in is undone by editing the variable, without new code.
+ */
+export function azpAllowed(azp: unknown, allowed: string | undefined): boolean {
+  const clients = (allowed ?? "")
+    .split(",")
+    .map((c) => c.trim())
+    .filter(Boolean);
+  if (clients.length === 0) return true;
+  return typeof azp === "string" && clients.includes(azp);
 }
 
 /**
@@ -169,8 +202,17 @@ export async function verifyIntraJwt(
   return { login, sub: String(payload.sub || ""), exp: payload.exp as number };
 }
 
+/**
+ * Under a deadline, body included: a stalled auth.42.fr used to hold the
+ * sign-in until the extension's 20 s timeout, which it reads as "could not
+ * reach the Better Intra server, check the site permission". A throw here is
+ * the 503 every build reads as "42's key server did not answer".
+ */
 async function fetchJwks(): Promise<Jwk[]> {
-  const res = await fetch(JWKS_URL, { headers: { Accept: "application/json" } });
+  const res = await fetch(JWKS_URL, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(FETCH_DEADLINES.jwksMs),
+  });
   if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
   const data = (await res.json()) as { keys?: Jwk[] };
   if (!Array.isArray(data.keys)) throw new Error("JWKS: no keys");
@@ -246,11 +288,15 @@ async function storeJwks(env: Env, sets: KeySets): Promise<void> {
   }
 }
 
+/** One answer for every token that does not open a session. */
+const invalidTokenRes = () =>
+  errorRes("unauthorized", "Invalid or expired Intra token", 401);
+
 export async function handleIntraAuth(
   request: Request,
   env: Env,
 ): Promise<Response> {
-  if (request.method !== "POST") return textRes("Method not allowed", 405);
+  if (request.method !== "POST") return methodNotAllowedRes();
 
   // Capped before anything else: request.json() buffered and parsed a body
   // of any size ahead of the per-IP limiter below.
@@ -262,7 +308,7 @@ export async function handleIntraAuth(
   if (!body.ok) return body.response;
   const token = body.value?.token;
   if (typeof token !== "string" || token.length < 20) {
-    return textRes("Missing token", 400);
+    return errorRes("bad_request", "Missing token", 400);
   }
 
   const now = Date.now();
@@ -270,11 +316,11 @@ export async function handleIntraAuth(
   // endpoint: this route is unauthenticated.
   const decoded = decodeJwt(token);
   if (!decoded || !checkClaims(decoded, now)) {
-    return textRes("Invalid or expired Intra token", 401);
+    return invalidTokenRes();
   }
   // Per IP, before any JWKS work: well-formed garbage must not turn into a
   // stream of key lookups (see src/rate-limit.ts for the limits).
-  if (await rateLimited(env, "anon", request.headers.get("CF-Connecting-IP"))) {
+  if (await rateLimited(env, "anon", clientKey(request.headers.get("CF-Connecting-IP")))) {
     return tooManyRes();
   }
 
@@ -283,44 +329,54 @@ export async function handleIntraAuth(
     sets = await getJwksForToken(env, decoded.header.kid, now);
   } catch (e) {
     console.warn(`[intra-auth] JWKS fetch failed: ${e}`);
-    return textRes("Intra key server unreachable, retry in a minute", 503);
+    // 503 is what every extension build reads as "42's key server did not
+    // answer"; the code is the generic one, nothing the client can act on.
+    return errorRes("server_error", "Intra key server unreachable, retry in a minute", 503);
   }
   const verified = await verifyIntraJwt(token, sets.keys, now);
   // Nothing is written before this point: a forged or invalid token never
   // costs a KV write.
-  if (!verified) return textRes("Invalid or expired Intra token", 401);
+  if (!verified) return invalidTokenRes();
+  // Checked on a verified token, so that the log line below only ever names
+  // a client 42 really issued a token to (a rename shows up in Workers Logs),
+  // never whatever a forger wrote. The id alone: never the token or login.
+  if (!azpAllowed(decoded.payload.azp, env.JWT_ALLOWED_AZP)) {
+    const client = JSON.stringify(String(decoded.payload.azp ?? "none").slice(0, 64));
+    console.warn(`[intra-auth] token refused: client ${client} is not in JWT_ALLOWED_AZP`);
+    return invalidTokenRes();
+  }
 
   const rawLogin = verified.login;
   const hashedLogin = await hashLogin(rawLogin);
   // Per login, once the token is known to be theirs: a student replaying
-  // their own valid token in a loop would otherwise spend a KV write and a
-  // D1 write per call out of the budget shared by every user.
+  // their own valid token in a loop would otherwise spend D1 writes per call,
+  // and a first sign-in a KV write, out of the budgets shared by every user.
   if (await rateLimited(env, "write", hashedLogin)) return tooManyRes();
   await storeJwks(env, sets);
-  const newSessionToken = crypto.randomUUID();
-  const existing: UserData =
-    (await env.BETTER_INTRA_KV.get(hashedLogin, { type: "json" })) || {};
 
-  const activeTokens = getTokens(existing);
-  activeTokens.push(newSessionToken);
-  if (activeTokens.length > 10) activeTokens.shift();
-
-  await env.BETTER_INTRA_KV.put(
-    hashedLogin,
-    JSON.stringify({
-      ...existing,
-      sessionTokens: activeTokens,
-      sessionToken: undefined,
-      settings: existing.settings || {},
-    }),
-  );
+  // Read for two things: a login still listed in KV has its tokens copied
+  // to D1 with the new session (so the other browsers stay signed in), and a
+  // first sign-in creates the record. Nothing else in it changes: a sign-in
+  // no longer rewrites the settings from a read that may be stale.
+  const existing: UserData | null = await env.BETTER_INTRA_KV.get(hashedLogin, {
+    type: "json",
+  });
+  // D1 first: if it fails, no KV write was spent on a sign-in that answers
+  // 500. A token whose record then fails to be created is never handed out.
+  const session = await createSession(env, hashedLogin, existing);
+  // Only with the login's first live session (a first sign-in, or one after
+  // a wipe). A location caches a miss too: next to a live session, "no
+  // record" is more likely a stale copy from before the first sign-in than a
+  // missing record, and writing {settings: {}} would erase the backup. A
+  // record that is really missing costs nothing: the settings read answers
+  // {} and the next push creates it.
+  if (!existing && session.first) await createRecord(env, hashedLogin);
 
   // The users row only feeds the community counter (/api/v1/public/stats).
-  // The session is stored by now: a D1 error must not turn a verified
+  // The session is stored by now: a D1 error here must not turn a verified
   // sign-in into a 500, which the extension shows as a failed login while
-  // the new token sits orphaned in the record, and a retry spends another KV
-  // write. No country is kept: nothing the extension does needs one. Only
-  // the first sign-in writes a row.
+  // the new session sits orphaned. No country is kept: nothing the
+  // extension does needs one. Only the first sign-in writes a row.
   try {
     await env.better_intra_d1
       .prepare("INSERT OR IGNORE INTO users (hash) VALUES (?)")
@@ -330,5 +386,30 @@ export async function handleIntraAuth(
     console.warn(`[intra-auth] users row insert failed: ${e}`);
   }
 
-  return jsonRes({ token: newSessionToken, login: rawLogin });
+  return jsonRes({ token: session.token, login: rawLogin });
+}
+
+/**
+ * The empty record of a first sign-in. Optional since sessions moved to D1
+ * (the session and its marker are stored by now, and a missing record reads
+ * as empty settings until the first push creates it), so the sign-in never
+ * fails for it: past the day's write budget, or with KV refusing the key
+ * twice, the record is left for the first push, and the student is signed in
+ * anyway. A 503 here would read as "42's key server did not answer" in every
+ * extension build, and the student could do nothing at all.
+ */
+async function createRecord(env: Env, hashedLogin: string): Promise<void> {
+  if (!(await spendKvWrite(env, hashedLogin, { globalCap: DAILY_KV_WRITES_SIGN_IN }))) {
+    console.warn("[intra-auth] daily write budget reached: first record left to the first push");
+    return;
+  }
+  const done = await retryKvBusy(async (again) => {
+    // Refused for the per-key limit: something wrote this key within the
+    // second, most likely the student's first push. Never overwrite it.
+    if (again && (await env.BETTER_INTRA_KV.get(hashedLogin))) return;
+    await env.BETTER_INTRA_KV.put(hashedLogin, JSON.stringify({ settings: {} }));
+  });
+  if (done === KV_BUSY) {
+    console.warn("[intra-auth] KV busy: first record left to the first push");
+  }
 }

@@ -7,7 +7,7 @@ import {
 } from "../src/handlers/settings";
 import { LIMITS, resetRateLimits } from "../src/rate-limit";
 import type { Env, UserData } from "../src/types";
-import { FakeKV, FakeRateLimit, makeEnv } from "./helpers/fake-env";
+import { FakeD1, FakeKV, FakeRateLimit, makeEnv, tokenHash } from "./helpers/fake-env";
 
 const LOGIN = "c".repeat(64);
 const OTHER = "9".repeat(64);
@@ -45,6 +45,13 @@ async function call(
     },
   );
   return handlePrivateSettings(req, env, login, await existing(env, login));
+}
+
+/** Token hashes of the login's D1 sessions, sorted. */
+function sessionHashes(d1: FakeD1, login = LOGIN): string[] {
+  return d1
+    .rows("SELECT token_hash FROM sessions WHERE login_hash = ? ORDER BY token_hash", login)
+    .map((r) => r.token_hash as string);
 }
 
 async function push(
@@ -99,8 +106,13 @@ describe("settings POST", () => {
       LOGTIME_GOAL_HOURS: 40,
     });
     expect(kv.puts).toHaveLength(2);
-    // the rest of the record is kept
-    expect(kv.json(LOGIN).sessionTokens).toEqual([SESSION, "session-c2"]);
+    // the legacy token list went with the first write (never in clear
+    // again); both sessions live on in D1
+    expect(kv.json(LOGIN)).toEqual({
+      settings: { BETTER_INTRA_THEME: "light", LOGTIME_GOAL_HOURS: 40 },
+      settingsRev: expect.any(Number),
+    });
+    expect((await call(env, { session: "session-c2" })).status).toBe(200);
   });
 
   it("never writes for an invalid session", async () => {
@@ -227,13 +239,14 @@ describe("settings GET", () => {
     const { env } = setup({ BETTER_INTRA_THEME: "dark", CUSTOM_CSS: "x" });
     const res = await call(env, { query: "&fields=meta" });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ activeSessions: 2, discordId: null });
+    expect(await res.json()).toEqual({ activeSessions: 2, discordId: null, rev: 0 });
 
     const full = await call(env);
     expect(await full.json()).toEqual({
       settings: { BETTER_INTRA_THEME: "dark", CUSTOM_CSS: "x" },
       activeSessions: 2,
       discordId: null,
+      rev: 0,
     });
   });
 });
@@ -305,23 +318,26 @@ describe("DELETE", () => {
   it("signing out is never rate limited: a 429 there left the token valid", async () => {
     const rl = new FakeRateLimit();
     rl.denyAll = true;
-    const { env, kv } = setup({ A: 1 }, { WRITE_RL: rl });
+    const { env, d1 } = setup({ A: 1 }, { WRITE_RL: rl });
     const res = await call(env, { method: "DELETE" });
     expect(res.status).toBe(200);
-    expect(kv.json(LOGIN)).toMatchObject({ sessionTokens: ["session-c2"] });
+    expect(sessionHashes(d1)).toEqual([tokenHash("session-c2")]);
     // Wipe all data still is
     const wipe = await call(env, { method: "DELETE", query: "&all=true", session: "session-c2" });
     expect(wipe.status).toBe(429);
   });
 
-  it("removes the calling session only", async () => {
-    const { env, kv } = setup({ A: 1 });
+  it("removes the calling session only, without a KV write", async () => {
+    const { env, kv, d1 } = setup({ A: 1 });
     const res = await call(env, { method: "DELETE" });
     expect(res.status).toBe(200);
-    expect(kv.json(LOGIN)).toEqual({
-      sessionTokens: ["session-c2"],
-      settings: { A: 1 },
-    });
+    expect(await res.text()).toBe("Session removed");
+    expect(sessionHashes(d1)).toEqual([tokenHash("session-c2")]);
+    expect(kv.puts).toEqual([]);
+    // the record still lists the token in its dead legacy copy: no way back
+    expect(kv.json(LOGIN).sessionTokens).toContain(SESSION);
+    expect((await call(env)).status).toBe(401);
+    expect((await call(env, { session: "session-c2" })).status).toBe(200);
   });
 
   it("all=true wipes the record, the calendar and the users row, keeps the link tombstone", async () => {
@@ -343,6 +359,13 @@ describe("DELETE", () => {
       LOGIN,
     );
     expect(tokens.find((t) => t.token === "tok-c")?.revoked_at).not.toBeNull();
+    // every session went, and the migration marker stayed: a location still
+    // serving the deleted record cannot copy its tokens back
+    expect(sessionHashes(d1)).toEqual([]);
+    expect(d1.rows("SELECT login_hash FROM session_migrations")).toEqual([{ login_hash: LOGIN }]);
+    kv.data.set(LOGIN, JSON.stringify({ sessionTokens: [SESSION, "session-c2"], settings: {} }));
+    expect((await call(env)).status).toBe(401);
+    expect(sessionHashes(d1)).toEqual([]);
   });
 
   it("all=true keeps the record when a D1 step fails, so the wipe can be retried", async () => {
@@ -353,5 +376,6 @@ describe("DELETE", () => {
     ).rejects.toThrow();
     expect(kv.data.has(LOGIN)).toBe(true);
     expect(kv.deletes).toEqual([]);
+    expect(sessionHashes(d1)).toHaveLength(2);
   });
 });

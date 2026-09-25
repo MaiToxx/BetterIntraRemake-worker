@@ -3,7 +3,8 @@ import worker from "../src/index";
 import { handlePrivateSettings } from "../src/handlers/settings";
 import { orientationSegment, stripImageMetadata } from "../src/image-strip";
 import type { Env, UserData } from "../src/types";
-import { FakeKV, FakeRateLimit, makeEnv } from "./helpers/fake-env";
+import { FakeD1, FakeKV, FakeRateLimit, budgetCount, kvRateLimitError, makeEnv } from "./helpers/fake-env";
+import { KV_RETRY } from "../src/utils";
 import { containsText, readFixture } from "./helpers/fixtures";
 import { LIMITS, resetRateLimits } from "../src/rate-limit";
 
@@ -254,5 +255,54 @@ describe("image delete", () => {
       env,
     );
     expect(res.status).toBe(405);
+  });
+});
+
+describe("image upload: daily budget and KV busy", () => {
+  beforeEach(() => {
+    KV_RETRY.delayMs = 0;
+  });
+  afterEach(() => {
+    KV_RETRY.delayMs = 1100;
+  });
+
+  it("spends one unit of the day's KV writes per stored upload, none per delete", async () => {
+    const d1 = env.better_intra_d1 as unknown as FakeD1;
+    await uploadedUrl(PNG);
+    expect(budgetCount(d1, LOGIN)).toBe(1);
+    expect((await remove()).status).toBe(204);
+    expect(budgetCount(d1, LOGIN)).toBe(1);
+  });
+
+  it("retries a write KV refused for the per-key limit, with the version of the write that stored it", async () => {
+    kv.putErrors.push(kvRateLimitError());
+    const res = await upload(PNG);
+    expect(res.status).toBe(200);
+    const { url } = (await res.json()) as { url: string };
+    expect(kv.putAttempts).toBe(2);
+    expect((await get(url)).status).toBe(200);
+  });
+
+  it("answers 503 kv_busy when the retry is refused too, and stores nothing", async () => {
+    kv.putErrors.push(kvRateLimitError(), kvRateLimitError());
+    const res = await upload(PNG);
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Retry-After")).toBe("2");
+    expect(((await res.json()) as { error: string }).error).toBe("kv_busy");
+    expect(kv.data.has(`img:${LOGIN}:avatar`)).toBe(false);
+  });
+
+  it("names both unreadable cases with one code", async () => {
+    const notImage = await upload(new TextEncoder().encode("hello"));
+    expect(notImage.status).toBe(415);
+    expect(((await notImage.json()) as { error: string }).error).toBe("unsupported_image_type");
+    // a PNG signature on a body that does not parse
+    const broken = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+    const res = await upload(broken);
+    expect(res.status).toBe(415);
+    expect(await res.json()).toEqual({
+      error: "unsupported_image_type",
+      message: "Could not read this image: save it again, or use another one",
+    });
   });
 });

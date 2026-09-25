@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { handleGhProxy, isBadPath } from "../src/handlers/gh-proxy";
+import { FETCH_DEADLINES } from "../src/utils";
+import { hangingFetch, stalledBody } from "./helpers/fake-env";
 
 function jsonResponse(
   body: string,
@@ -108,5 +110,93 @@ describe("handleGhProxy", () => {
     const res = await handleGhProxy(request);
 
     expect(res.headers.get("content-type")).toBe("application/json");
+  });
+});
+
+describe("handleGhProxy when a source throws or stalls", () => {
+  const DEADLINE = FETCH_DEADLINES.ghSourceMs;
+  const request = () => new Request("https://api.betterintra.com/gh/campuses/campuses.json");
+  let calls: string[];
+  let signals: (AbortSignal | undefined)[];
+  let warn: ReturnType<typeof vi.spyOn>;
+
+  /** raw.githubusercontent answers with `raw`, jsDelivr with `cdn`. */
+  function sources(
+    raw: (url: string, init?: RequestInit) => Promise<Response>,
+    cdn: (url: string, init?: RequestInit) => Promise<Response> = async () => jsonResponse("cdn"),
+  ) {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      calls.push(url);
+      signals.push(init?.signal ?? undefined);
+      return url.includes("raw.githubusercontent.com") ? raw(url, init) : cdn(url, init);
+    }) as unknown as typeof fetch;
+  }
+
+  beforeEach(() => {
+    calls = [];
+    signals = [];
+    FETCH_DEADLINES.ghSourceMs = 20;
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    FETCH_DEADLINES.ghSourceMs = DEADLINE;
+    vi.restoreAllMocks();
+  });
+
+  it("serves jsDelivr when raw.githubusercontent throws, instead of a 500", async () => {
+    sources(async () => {
+      throw new TypeError("Network connection lost.");
+    });
+    const res = await handleGhProxy(request());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("cdn");
+    expect(calls).toHaveLength(2);
+    expect(String(warn.mock.calls[0][0])).toContain("raw.githubusercontent.com failed: TypeError");
+  });
+
+  it("serves jsDelivr when raw.githubusercontent never answers", async () => {
+    sources(hangingFetch());
+    const res = await handleGhProxy(request());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("cdn");
+    expect(String(warn.mock.calls[0][0])).toContain("TimeoutError");
+  });
+
+  it("serves jsDelivr when raw.githubusercontent stalls in the middle of the body", async () => {
+    sources(async (_url, init) => stalledBody(init, '{"campuses": ['));
+    const res = await handleGhProxy(request());
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("cdn");
+  });
+
+  it("puts a deadline on every source", async () => {
+    sources(async () => jsonResponse("gone", 503));
+    await handleGhProxy(request());
+    expect(signals).toHaveLength(2);
+    for (const signal of signals) expect(signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("keeps a 404 when the other source throws: campus.ts caches a missing campus on 404 only", async () => {
+    sources(
+      async () => jsonResponse("404: Not Found", 404, "text/plain"),
+      async () => {
+        throw new TypeError("fetch failed");
+      },
+    );
+    const res = await handleGhProxy(request());
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: "not_found", message: "Failed to fetch upstream" });
+  });
+
+  it("answers 502 when no source answered at all", async () => {
+    sources(hangingFetch(), async () => {
+      throw new TypeError("fetch failed");
+    });
+    const res = await handleGhProxy(request());
+    expect(res.status).toBe(502);
+    expect(await res.json()).toEqual({ error: "server_error", message: "Failed to fetch upstream" });
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 });
